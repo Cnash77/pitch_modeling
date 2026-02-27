@@ -1,103 +1,134 @@
 import duckdb
 import pandas as pd
-import numpy as np
+from pybaseball import pitching_stats
 
 #############################################
-# 1. CONNECT
+# SETTINGS
+#############################################
+
+START_YEAR = 2021
+END_YEAR = 2025
+
+#############################################
+# CONNECT
 #############################################
 
 con = duckdb.connect("pitch_design.db")
 
 #############################################
-# 2. LOAD RAW DATA
+# PULL OFFICIAL DATA
 #############################################
 
-pitch_data = con.execute("""
-SELECT *
-FROM raw_statcast
-""").df()
+print("Pulling FanGraphs pitching data...")
 
-#############################################
-# 3. BUILD PLATE APPEARANCE TABLE
-#############################################
-
-# Keep only rows that end a PA
-pa_data = pitch_data[pitch_data["events"].notna()].copy()
-
-# Create unique PA ID
-pa_data["pa_id"] = (
-    pa_data["game_pk"].astype(str) + "_" +
-    pa_data["at_bat_number"].astype(str)
+pitcher_season = pitching_stats(
+    START_YEAR,
+    END_YEAR,
+    qual=0
 )
 
 #############################################
-# 4. DEFINE STRIKEOUT EVENTS
+# CLEAN / STANDARDIZE
 #############################################
 
-strikeout_events = [
-    "strikeout",
-    "strikeout_double_play"
+pitcher_season = pitcher_season.rename(columns={
+    "Name": "player_name",
+    "Season": "game_year",
+    "Team": "team",
+    "IP": "innings_pitched",
+    "K%": "K_percent",
+    "BB%": "BB_percent",
+    "HR": "home_runs",
+    "SO": "strikeouts",
+    "BB": "walks",
+    "HBP": "hbp"
+})
+
+# Ensure numeric
+numeric_cols = [
+    "innings_pitched","ERA","FIP","xFIP","WAR",
+    "K_percent","BB_percent",
+    "home_runs","strikeouts","walks","hbp"
 ]
 
-pa_data["is_strikeout"] = (
-    pa_data["events"].isin(strikeout_events).astype(int)
-)
+for col in numeric_cols:
+    if col in pitcher_season.columns:
+        pitcher_season[col] = pd.to_numeric(
+            pitcher_season[col],
+            errors="coerce"
+        )
 
 #############################################
-# 5. AGGREGATE BY PITCHER + YEAR
+# CREATE ERA+ AND FIP+
 #############################################
 
-pitcher_season = (
-    pa_data
-    .groupby(["pitcher","game_year"])
-    .agg(
-        batters_faced=("pa_id","nunique"),
-        strikeouts=("is_strikeout","sum")
+# League ERA by season (IP-weighted)
+league_era = (
+    pitcher_season
+    .groupby("game_year")
+    .apply(lambda x:
+        (x["ERA"] * x["innings_pitched"]).sum()
+        / x["innings_pitched"].sum()
     )
-    .reset_index()
+    .reset_index(name="league_ERA")
+)
+
+pitcher_season = pitcher_season.merge(
+    league_era,
+    on="game_year",
+    how="left"
+)
+
+pitcher_season["ERA_plus"] = (
+    100 * pitcher_season["league_ERA"]
+    / pitcher_season["ERA"]
+)
+
+# League FIP by season (IP-weighted)
+league_fip = (
+    pitcher_season
+    .groupby("game_year")
+    .apply(lambda x:
+        (x["FIP"] * x["innings_pitched"]).sum()
+        / x["innings_pitched"].sum()
+    )
+    .reset_index(name="league_FIP")
+)
+
+pitcher_season = pitcher_season.merge(
+    league_fip,
+    on="game_year",
+    how="left"
+)
+
+pitcher_season["FIP_plus"] = (
+    100 * pitcher_season["league_FIP"]
+    / pitcher_season["FIP"]
 )
 
 #############################################
-# 6. CALCULATE K%
-#############################################
-
-pitcher_season["K_percent"] = (
-    pitcher_season["strikeouts"] /
-    pitcher_season["batters_faced"]
-)
-
-#############################################
-# 7. FILTER SMALL SAMPLES (STABILITY)
+# OPTIONAL SAMPLE FILTER
 #############################################
 
 pitcher_season = pitcher_season[
-    pitcher_season["batters_faced"] >= 100
+    pitcher_season["innings_pitched"] >= 30
 ]
 
 #############################################
-# 8. SAVE TO DUCKDB
+# SAVE TO DUCKDB
 #############################################
 
 con.register("season_df", pitcher_season)
 
 con.execute("""
 CREATE OR REPLACE TABLE pitcher_season_stats AS
-SELECT p.player_name,
-       c.*
-FROM season_df c
-INNER JOIN pitchers p
-ON c.pitcher = p.pitcher
+SELECT *
+FROM season_df
 """)
 
-con.execute("""
-COPY (
-    SELECT *
-    FROM pitcher_season_stats
-)
-TO 'pitcher_season_stats.csv' (HEADER, DELIMITER ',');
-""")
+pitcher_season.to_csv("pitcher_season_stats.csv", index=False)
 
-print("\nCreated pitcher_season_stats (robust PA method)\n")
-print(pitcher_season.sort_values("K_percent", ascending=False).head())
+print("\nOfficial pitcher_season_stats created\n")
+print(pitcher_season.head())
 
 con.close()
