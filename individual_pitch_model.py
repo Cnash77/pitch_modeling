@@ -688,6 +688,150 @@ def calculate_ball_plus():
     print("Ball+ model complete.")
     con.close()
 
+def calculate_swing_plus():
+    #############################################
+    # 1. LOAD DATA
+    #############################################
+
+    con = duckdb.connect("pitch_design.db")
+    data = con.sql("SELECT * FROM raw_statcast").df()
+
+    #############################################
+    # 2. BUILD SWING TARGET
+    #############################################
+
+    swing_events = [
+        "swinging_strike",
+        "swinging_strike_blocked",
+        "foul",
+        "foul_tip",
+        "hit_into_play",
+        "hit_into_play_score",
+        "hit_into_play_no_out"
+    ]
+
+    data["is_swing"] = data["description"].isin(swing_events).astype(int)
+
+    #############################################
+    # 3. FEATURE ENGINEERING
+    #############################################
+
+    # Normalize vertical location inside strike zone
+    data["zone_height_norm"] = (
+        (data["plate_z"] - data["sz_bot"]) /
+        (data["sz_top"] - data["sz_bot"])
+    )
+
+    # Handedness flags
+    data["is_RHP"] = (data["p_throws"] == "R").astype(int)
+    data["is_RHB"] = (data["stand"] == "R").astype(int)
+
+    # Keep original pitch_type but convert to category
+    data["pitch_type"] = data["pitch_type"].astype("category")
+
+    #############################################
+    # 4. FEATURE SET
+    #############################################
+
+    swing_features = [
+        "release_speed",
+        "release_spin_rate",
+        "pfx_x",
+        "pfx_z",
+        "plate_x",
+        "zone_height_norm",
+        "balls",
+        "strikes",
+        "is_RHP",
+        "is_RHB",
+        "pitch_type"
+    ]
+
+    data_model = data.dropna(subset=swing_features + ["is_swing"]).copy()
+
+    X = data_model[swing_features]
+    y = data_model["is_swing"]
+
+    #############################################
+    # 5. TRAIN / TEST SPLIT
+    #############################################
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42
+    )
+
+    #############################################
+    # 6. TRAIN MODEL
+    #############################################
+
+    model = xgb.XGBClassifier(
+        n_estimators=300,
+        max_depth=5,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        enable_categorical=True,
+        eval_metric="logloss",
+        random_state=42
+    )
+
+    model.fit(X_train, y_train)
+
+    #############################################
+    # 7. EVALUATE
+    #############################################
+
+    preds = model.predict_proba(X_test)[:, 1]
+    auc = roc_auc_score(y_test, preds)
+
+    print(f"Swing Model AUC: {auc:.4f}")
+
+    #############################################
+    # 8. GENERATE PITCH-LEVEL EXPECTED SWING
+    #############################################
+
+    data_model["xSwing"] = model.predict_proba(X)[:, 1]
+
+    #############################################
+    # 9. SCALE TO SWING+
+    #############################################
+
+    league_mean = data_model["xSwing"].mean()
+    league_std = data_model["xSwing"].std()
+
+    data_model["Swing_plus"] = 100 + 10 * (
+        (data_model["xSwing"] - league_mean) / league_std
+    )
+
+    #############################################
+    # 10. AGGREGATE TO PITCHER / PITCH TYPE / SEASON
+    #############################################
+
+    grouped = (
+        data_model
+        .groupby(["pitcher", "game_year", "pitch_type"])
+        .agg(
+            pitches=("is_swing", "count"),
+            avg_xSwing=("xSwing", "mean"),
+            Swing_plus=("Swing_plus", "mean")
+        )
+        .reset_index()
+    )
+
+    #############################################
+    # 11. SAVE OUTPUT
+    #############################################
+
+    con.register("grouped_df", grouped)
+
+    con.execute("""
+    CREATE OR REPLACE TABLE swing_plus AS
+    SELECT * FROM grouped_df
+    """)
+
+    print("Swing+ model complete. Output saved to swing_plus.csv")
+    con.close()
+
 def calculate_pitch_composite_score(): 
     # -----------------------------------
     # Connect
@@ -1059,11 +1203,8 @@ def calculate_stuff_plus():
 
     con.execute("""
     CREATE OR REPLACE TABLE pitcher_stuff AS
-    SELECT p.player_name,
-        c.*
-    FROM pitcher_stuff_df c
-    INNER JOIN pitchers p
-    ON c.pitcher = p.pitcher
+    SELECT *
+    FROM pitcher_stuff_df
     """)
 
     print("Physics-Based Stuff+ (Full Arsenal) Complete")
@@ -1074,7 +1215,7 @@ def compile_full_pitch_model():
 
     con.execute("""CREATE OR REPLACE TABLE pitcher_advanced_model_pitches AS
     SELECT rs.pitcher,
-        p.player_name,
+        p.full_name,
         rs.season,
         rs.pitch_type,
         rs.pitches_thrown,
@@ -1148,7 +1289,7 @@ def compile_full_pitch_model():
         GROUP BY pitcher, game_year, pitch_type) AS rs
     INNER JOIN pitch_grade pg ON rs.pitcher = pg.pitcher AND rs.season = pg.game_year AND rs.pitch_type = pg.pitch_type
     INNER JOIN pitcher_stuff ps ON rs.pitcher = ps.pitcher AND rs.season = ps.game_year AND rs.pitch_type = ps.pitch_type 
-    INNER JOIN pitchers p ON rs.pitcher = p.pitcher
+    INNER JOIN player_id_map p ON rs.pitcher = p.key_mlbam
     ORDER BY rs.pitcher, rs.season DESC, usage_rate DESC;""")
 
 
@@ -1164,6 +1305,7 @@ if __name__ == '__main__':
     calculate_contact_plus()
     calculate_strike_plus()
     calculate_ball_plus()
+    calculate_swing_plus()
     calculate_pitch_composite_score()
     calculate_stuff_plus()
     compile_full_pitch_model()

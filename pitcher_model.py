@@ -11,8 +11,8 @@ def pitcher_season_stats():
     # SETTINGS
     #############################################
 
-    START_YEAR = 2015
-    END_YEAR = 2024
+    START_YEAR = 2021
+    END_YEAR = 2025
 
     #############################################
     # CONNECT
@@ -316,19 +316,8 @@ def pitcher_clutch():
 
     con.execute("""
     CREATE OR REPLACE TABLE pitcher_clutch AS
-    SELECT p.player_name,
-        c.*    
-    FROM clutch_df c
-    INNER JOIN pitchers p 
-    ON c.pitcher = p.pitcher
-    """)
-
-    con.execute("""
-        COPY (
-            SELECT *
-            FROM pitcher_clutch
-        )
-        TO 'pitcher_clutch.csv' (HEADER, DELIMITER ',');
+    SELECT *    
+    FROM clutch_df
     """)
 
     print("\nHistorical Clutch Model Complete\n")
@@ -355,8 +344,9 @@ def arsenal_plus():
     """).df()
 
     k_data = con.execute("""
-    SELECT pitcher, game_year, K_percent
-    FROM pitcher_season_stats
+    SELECT p.key_mlbam as pitcher, pss.game_year, pss.K_percent
+    FROM pitcher_season_stats pss
+    INNER JOIN player_id_map p ON pss.IDfg = p.key_fangraphs
     """).df()
 
     #############################################
@@ -666,11 +656,8 @@ def arsenal_plus():
 
     con.execute("""
     CREATE OR REPLACE TABLE arsenal_plus AS
-    SELECT p.player_name,
-        c.*
-    FROM arsenal_df c
-    INNER JOIN pitchers p
-    ON c.pitcher = p.pitcher
+    SELECT *
+    FROM arsenal_df 
     """)
                 
     con.close()
@@ -983,20 +970,8 @@ def relief_run_prevention_plus():
 
     con.execute("""
     CREATE OR REPLACE TABLE relief_run_prevention_plus AS
-    SELECT p.player_name,
-        c.*
-    FROM rrp_df c
-    INNER JOIN pitchers p
-    ON c.pitcher = p.pitcher
-    """)
-
-    con.execute("""
-    COPY (
-        SELECT *
-        FROM relief_run_prevention_plus
-    )
-    TO 'relief_run_prevention_plus.csv'
-    (HEADER, DELIMITER ',');
+    SELECT *
+    FROM rrp_df 
     """)
 
     print("\nRelief Run Prevention+ (Final Model) Complete\n")
@@ -1068,8 +1043,8 @@ def compile_full_pitcher_model():
 
 #Run Main Function
 if __name__ == '__main__':
-    #pitcher_season_stats()
-    #pitcher_clutch()
-    #arsenal_plus()
-    #relief_run_prevention_plus()
+    pitcher_season_stats()
+    pitcher_clutch()
+    arsenal_plus()
+    relief_run_prevention_plus()
     compile_full_pitcher_model()

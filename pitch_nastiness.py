@@ -139,7 +139,6 @@ con.execute("""
 #############################################
 
 df_2025 = df[df["game_year"] == 2025]
-df_2025 = df[df["game_year"] == 2025]
 df_2025.to_csv("pitch_nastiness_2025.csv", index=False)
 
 print("\nDirectional Nastiness model complete.\n")

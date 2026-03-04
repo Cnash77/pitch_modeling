@@ -130,11 +130,6 @@ def populate_raw_baseballref():
     FROM season_df
     """)
 
-    pitcher_season.to_csv("pitcher_season_stats.csv", index=False)
-
-    print("\nOfficial pitcher_season_stats created\n")
-    print(pitcher_season.head())
-
     con.close()
 
 def populate_raw_statcast():
@@ -200,13 +195,6 @@ def populate_raw_statcast():
         CAST(at_bat_number AS VARCHAR) || '_' ||
         CAST(pitch_number AS VARCHAR);""")
 
-    con.execute("COPY (SELECT * FROM raw_statcast LIMIT 100) TO 'raw_statcast.csv' (HEADER, DELIMITER ',');")
-
-    id_map = chadwick_register()
-    statcast_df = statcast_df.rename(columns={
-        "pitcher": "key_mlbam"
-    })
-
     #Close db connection
     con.close()
 
@@ -249,6 +237,7 @@ def populate_player_lookup():
         id_map["name_last"].fillna("").str.strip()
     ).str.strip()
 
+
     # Drop duplicates on MLBAM ID (keep most recent MLB season)
     id_map = (
         id_map
@@ -267,19 +256,6 @@ def populate_player_lookup():
     SELECT *
     FROM id_map_df
     """)
-
-    #############################################
-    # 5. EXPORT CSV (OPTIONAL)
-    #############################################
-
-    con.execute("""
-    COPY player_id_map
-    TO 'player_id_map.csv'
-    (HEADER, DELIMITER ',');
-    """)
-
-    print("\nplayer_id_map table created successfully.\n")
-    print(id_map.head())
 
     con.close()
 
