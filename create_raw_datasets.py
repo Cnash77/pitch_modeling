@@ -5,23 +5,15 @@ from pybaseball import pitching_stats
 import duckdb
 import pandas as pd
 
+#############################################
+# 1. POPULATE BASEBALL REFERENCE DATA
+#############################################
 def populate_raw_baseballref():
-    #############################################
-    # SETTINGS
-    #############################################
 
     START_YEAR = 2021
     END_YEAR = 2025
 
-    #############################################
-    # CONNECT
-    #############################################
-
     con = duckdb.connect("pitch_design.db")
-
-    #############################################
-    # PULL OFFICIAL DATA
-    #############################################
 
     print("Pulling FanGraphs pitching data...")
 
@@ -32,7 +24,7 @@ def populate_raw_baseballref():
     )
 
     #############################################
-    # CLEAN / STANDARDIZE
+    # SELECT COLUMNS
     #############################################
 
     pitcher_season = pitcher_season.rename(columns={
@@ -48,7 +40,6 @@ def populate_raw_baseballref():
         "HBP": "hbp"
     })
 
-    # Ensure numeric
     numeric_cols = [
         "innings_pitched","ERA","FIP","xFIP","WAR",
         "K_percent","BB_percent",
@@ -111,14 +102,6 @@ def populate_raw_baseballref():
     )
 
     #############################################
-    # OPTIONAL SAMPLE FILTER
-    #############################################
-
-    pitcher_season = pitcher_season[
-        pitcher_season["innings_pitched"] >= 30
-    ]
-
-    #############################################
     # SAVE TO DUCKDB
     #############################################
 
@@ -132,13 +115,18 @@ def populate_raw_baseballref():
 
     con.close()
 
+#############################################
+# 2. POPULATE STATCAST DATA
+#############################################
 def populate_raw_statcast():
     con = duckdb.connect("pitch_design.db")
     data = statcast(start_dt="2021-03-01", end_dt="2025-12-31")
     pybaseball.cache.enable()
 
+    #Create Raw Table
     con.execute("CREATE TABLE raw_statcast AS SELECT * FROM data")
 
+    #Create Whiff Flag
     con.execute("""ALTER TABLE raw_statcast ADD COLUMN whiff_flag INTEGER;
     UPDATE raw_statcast
     SET whiff_flag = CASE
@@ -147,6 +135,7 @@ def populate_raw_statcast():
         ELSE 0
     END;""")
 
+    #Create Swing Flag
     con.execute("""ALTER TABLE raw_statcast ADD COLUMN swing_flag INTEGER;
     UPDATE raw_statcast
     SET swing_flag = CASE
@@ -163,6 +152,7 @@ def populate_raw_statcast():
         ELSE 0
     END;""")
 
+    #Create Strike Flag
     con.execute("""ALTER TABLE raw_statcast ADD COLUMN called_strike_flag INTEGER;
     UPDATE raw_statcast
     SET called_strike_flag = CASE
@@ -171,6 +161,7 @@ def populate_raw_statcast():
         ELSE 0
     END;""")
 
+    #Create Hard Hit Flag
     con.execute("""ALTER TABLE raw_statcast ADD COLUMN hard_hit_flag INTEGER;
     UPDATE raw_statcast
     SET hard_hit_flag = CASE
@@ -178,6 +169,7 @@ def populate_raw_statcast():
         ELSE 0
     END;""")
 
+    #Create Barrel Flag
     con.execute("""ALTER TABLE raw_statcast ADD COLUMN barrel_flag INTEGER;
     UPDATE raw_statcast
     SET barrel_flag = CASE
@@ -187,6 +179,7 @@ def populate_raw_statcast():
         ELSE 0
     END;""")
 
+    #Create Primary Key
     con.execute("""ALTER TABLE raw_statcast ADD COLUMN pitch_pk VARCHAR;
     UPDATE raw_statcast
     SET pitch_pk =
@@ -195,18 +188,17 @@ def populate_raw_statcast():
         CAST(at_bat_number AS VARCHAR) || '_' ||
         CAST(pitch_number AS VARCHAR);""")
 
-    #Close db connection
     con.close()
 
+#############################################
+# 3. POPULATE PLAYER LOOKUP TABLE
+#############################################
 def populate_player_lookup():
-    #############################################
-    # 1. CONNECT TO DATABASE
-    #############################################
 
     con = duckdb.connect("pitch_design.db")
 
     #############################################
-    # 2. PULL CHADWICK REGISTER
+    # 1. PULL CHADWICK REGISTER
     #############################################
 
     print("Pulling Chadwick player register...")
@@ -216,7 +208,7 @@ def populate_player_lookup():
     print(f"Total records pulled: {len(id_map)}")
 
     #############################################
-    # 3. KEEP RELEVANT COLUMNS
+    # 2. SELECT COLUMNS
     #############################################
 
     id_map = id_map[[
@@ -230,7 +222,7 @@ def populate_player_lookup():
         "mlb_played_last"
     ]].copy()
 
-    # Create FULL NAME column (first + last)
+    # Create Full Name column (first + last)
     id_map["full_name"] = (
         id_map["name_first"].fillna("").str.strip() +
         " " +
@@ -246,7 +238,7 @@ def populate_player_lookup():
     )
 
     #############################################
-    # 4. SAVE TO DUCKDB
+    # 3. SAVE TO DUCKDB
     #############################################
 
     con.register("id_map_df", id_map)
@@ -259,6 +251,9 @@ def populate_player_lookup():
 
     con.close()
 
+#############################################
+# MAIN FUNCTION
+#############################################
 if __name__ == '__main__':
     populate_raw_baseballref()
     populate_raw_statcast()

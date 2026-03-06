@@ -4,7 +4,7 @@ import numpy as np
 from sklearn.preprocessing import StandardScaler
 
 #############################################
-# 1️⃣ LOAD DATA
+# 1. LOAD DATA
 #############################################
 
 con = duckdb.connect("pitch_design.db")
@@ -36,10 +36,10 @@ AND pitch_type != 'FA'
 print(f"Loaded {len(df):,} pitches")
 
 #############################################
-# 2️⃣ FEATURE ENGINEERING (PHYSICS ONLY)
+# 2. FEATURE ENGINEERING
 #############################################
 
-# Absolute movement (extremeness matters)
+# Absolute movement
 df["abs_vert_break"]  = df["pfx_z"].abs()
 df["abs_horiz_break"] = df["pfx_x"].abs()
 
@@ -54,12 +54,12 @@ features = [
 df = df.dropna(subset=features + ["pitch_type"])
 
 #############################################
-# 3️⃣ DEFINE PITCH FAMILIES
+# 3. DEFINE PITCH FAMILIES
 #############################################
 
 fastballs = ["FF", "SI", "FC"]
-breaking  = ["SL", "CU", "KC", "SW", "ST", "SV", "CS"]
-offspeed  = ["CH", "FS", "SC", "FO", "KN"]
+breaking  = ["SL", "CU", "KC", "ST", "SV", "CS", "KN"]
+offspeed  = ["CH", "FS", "SC", "FO"]
 
 def pitch_family(pt):
     if pt in fastballs:
@@ -74,7 +74,7 @@ def pitch_family(pt):
 df["pitch_family"] = df["pitch_type"].apply(pitch_family)
 
 #############################################
-# 4️⃣ FAMILY-RELATIVE MAHALANOBIS
+# 4. FAMILY-RELATIVE MAHALANOBIS
 #############################################
 
 df["nastiness_raw"] = np.nan
@@ -108,7 +108,7 @@ for fam in df["pitch_family"].unique():
     df.loc[fam_df.index, "nastiness_raw"] = distances
 
 #############################################
-# 5️⃣ LEAGUE-WIDE SCALING TO NASTINESS+
+# 5. LEAGUE-WIDE CALCULATING NASTINESS+
 #############################################
 
 mean = df["nastiness_raw"].mean()
@@ -123,7 +123,7 @@ print("Mean:", round(df["Nastiness_plus"].mean(),2))
 print("Std:", round(df["Nastiness_plus"].std(),2))
 
 #############################################
-# 6️⃣ SAVE FULL PITCH-LEVEL TABLE
+# 6. SAVE FULL NASTINESS+ TABLE
 #############################################
 
 con.register("nastiness_df", df)
@@ -135,7 +135,7 @@ con.execute("""
 """)
 
 #############################################
-# EXPORT 2025
+# 7. EXPORT 2025 NASTINESS+
 #############################################
 
 df_2025 = df[df["game_year"] == 2025]

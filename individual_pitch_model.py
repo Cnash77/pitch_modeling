@@ -9,10 +9,11 @@ from sklearn.metrics import mean_squared_error
 from xgboost import XGBClassifier
 from sklearn.metrics import roc_auc_score
 
+#############################################
+# 1. CALCULATE WHIFF+
+#############################################
 def calculate_whiff_plus():
-    # -----------------------------------
-    # Connect + Load Data
-    # -----------------------------------
+
     con = duckdb.connect("pitch_design.db")
 
     data = con.execute("""
@@ -45,14 +46,11 @@ def calculate_whiff_plus():
     FROM raw_statcast
     """).df()
 
-    # -----------------------------------
-    # Basic Cleaning
-    # -----------------------------------
     data = data.dropna()
 
-    # -----------------------------------
-    # Create Whiff + Swing Flags
-    # -----------------------------------
+    #############################################
+    # 1. CREATE WHIFF AND SWING FLAGS
+    #############################################
     data["is_whiff"] = data["description"].isin([
         "swinging_strike",
         "swinging_strike_blocked"
@@ -69,9 +67,9 @@ def calculate_whiff_plus():
     # Only model whiff conditional on swing
     data = data[data["is_swing"] == 1].copy()
 
-    # -----------------------------------
-    # Feature Engineering
-    # -----------------------------------
+    #############################################
+    # 2. FEATURE ENGINEERING
+    #############################################
 
     # Handedness flags
     data["is_RHP"] = (data["p_throws"] == "R").astype(int)
@@ -109,14 +107,14 @@ def calculate_whiff_plus():
         "is_RHB"
     ]
 
-    # -----------------------------------
-    # Initialize Prediction Column
-    # -----------------------------------
+    #############################################
+    # 3. INITALIZE PREDICTOR COLUMN
+    #############################################
     data["raw_whiff"] = np.nan
 
-    # -----------------------------------
-    # Train Per Pitch Type (Time Split)
-    # -----------------------------------
+    #############################################
+    # TRAIN BY PITCH TYPE
+    #############################################
     pitch_types = data["pitch_type"].unique()
 
     for pitch in pitch_types:
@@ -159,9 +157,9 @@ def calculate_whiff_plus():
 
         data.loc[pitch_df.index, "raw_whiff"] = full_pred
 
-    # -----------------------------------
-    # Global Scaling (Critical Fix)
-    # -----------------------------------
+    #############################################
+    # 5. GLOBAL SCALING
+    #############################################
     league_mean = data["raw_whiff"].mean()
     league_std  = data["raw_whiff"].std()
 
@@ -169,9 +167,9 @@ def calculate_whiff_plus():
         100 + 10 * ((data["raw_whiff"] - league_mean) / league_std)
     )
 
-    # -----------------------------------
-    # Aggregate to Pitcher + Pitch Type + Season
-    # -----------------------------------
+    #############################################
+    # 6. GROUP BY PITCHER, YEAR, AND PITCH TYPE
+    #############################################
     pitcher_whiff = (
         data.groupby(["pitcher", "game_year", "pitch_type"])
             .agg(
@@ -182,12 +180,11 @@ def calculate_whiff_plus():
             .reset_index()
     )
 
-    # Optional minimum swings filter
     pitcher_whiff = pitcher_whiff[pitcher_whiff["swings"] >= 50]
 
-    # -----------------------------------
-    # Save
-    # -----------------------------------
+    #############################################
+    # 7. SAVE TO DUCKDB
+    #############################################
     con.register("pitcher_whiff_df", pitcher_whiff)
 
     con.execute("""
@@ -199,6 +196,9 @@ def calculate_whiff_plus():
 
     con.close()
 
+#############################################
+# 2. CALCULATE CONTACT+
+#############################################
 def calculate_contact_plus():
     #############################################
     # 1. LOAD DATA
@@ -361,6 +361,9 @@ def calculate_contact_plus():
     print("Contact+ model complete.")
     con.close()
 
+#############################################
+# 3. CALCULATE STRIKE+
+#############################################
 def calculate_strike_plus():
     #############################################
     # 1. LOAD DATA
@@ -516,6 +519,9 @@ def calculate_strike_plus():
     print("Strike+ model complete.")
     con.close()
 
+#############################################
+# 4. CALCULATE BALL+
+#############################################
 def calculate_ball_plus():
     #############################################
     # 1. LOAD DATA
@@ -688,6 +694,9 @@ def calculate_ball_plus():
     print("Ball+ model complete.")
     con.close()
 
+#############################################
+# 5. CALCULATE SWING+
+#############################################
 def calculate_swing_plus():
     #############################################
     # 1. LOAD DATA
@@ -832,15 +841,18 @@ def calculate_swing_plus():
     print("Swing+ model complete. Output saved to swing_plus.csv")
     con.close()
 
+#############################################
+# 6. CALCULATE PITCHGRADE+
+#############################################
 def calculate_pitch_composite_score(): 
-    # -----------------------------------
-    # Connect
-    # -----------------------------------
+    #############################################
+    # 1. CONNECT TO DUCKDB
+    #############################################
     con = duckdb.connect("pitch_design.db")
 
-    # -----------------------------------
-    # Load Whiff+
-    # -----------------------------------
+    #############################################
+    # 2. LOAD METRICS AND MERGE INTO ONE DATAFRAME
+    #############################################
     whiff = con.execute("""
     SELECT
         pitcher,
@@ -851,9 +863,6 @@ def calculate_pitch_composite_score():
     FROM pitcher_whiff
     """).df()
 
-    # -----------------------------------
-    # Load Contact+
-    # -----------------------------------
     contact = con.execute("""
     SELECT
         pitcher,
@@ -865,9 +874,6 @@ def calculate_pitch_composite_score():
     FROM contact_plus
     """).df()
 
-    # -----------------------------------
-    # Load Swing+
-    # -----------------------------------
     swing = con.execute("""
     SELECT
         pitcher,
@@ -878,9 +884,6 @@ def calculate_pitch_composite_score():
     FROM swing_plus
     """).df()
 
-    # -----------------------------------
-    # Load Strike+
-    # -----------------------------------
     strike = con.execute("""
     SELECT
         pitcher,
@@ -891,9 +894,6 @@ def calculate_pitch_composite_score():
     FROM strike_plus
     """).df()
 
-    # -----------------------------------
-    # Load Ball+
-    # -----------------------------------
     ball = con.execute("""
     SELECT
         pitcher,
@@ -904,9 +904,6 @@ def calculate_pitch_composite_score():
     FROM ball_plus
     """).df()
 
-    # -----------------------------------
-    # Merge All Components
-    # -----------------------------------
     df = (
         whiff
         .merge(contact, on=["pitcher","game_year","pitch_type"], how="inner")
@@ -915,9 +912,9 @@ def calculate_pitch_composite_score():
         .merge(ball,    on=["pitcher","game_year","pitch_type"], how="inner")
     )
 
-    # -----------------------------------
-    # Stability Filters
-    # -----------------------------------
+    #############################################
+    # 3. REMOVE SMALL SAMPLES
+    #############################################
     df = df[
         (df["swings"] >= 50) &
         (df["bip"] >= 25) &
@@ -926,16 +923,16 @@ def calculate_pitch_composite_score():
         (df["ball_pitches"] >= 100)
     ]
 
-    # -----------------------------------
-    # DEFINE TARGET
-    # -----------------------------------
+    #############################################
+    # 4. DEFINE TARGET
+    #############################################
     TARGET = "avg_xContact"
 
     df = df.dropna(subset=[TARGET]).copy()
 
-    # -----------------------------------
-    # STANDARDIZE FEATURES
-    # -----------------------------------
+    #############################################
+    # 5. STANDARDIZE FEATURES
+    #############################################
     feature_cols = [
         "Whiff_plus",
         "Contact_plus",
@@ -950,31 +947,28 @@ def calculate_pitch_composite_score():
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
 
-    # -----------------------------------
-    # FIT LINEAR REGRESSION
-    # -----------------------------------
+    #############################################
+    # 6. BUILD LINEAR REGRESSION
+    #############################################
     reg = LinearRegression()
     reg.fit(X_scaled, y)
 
     betas = dict(zip(feature_cols, reg.coef_))
 
-    # -----------------------------------
-    # NORMALIZE WEIGHTS
-    # -----------------------------------
+    #############################################
+    # 7. NORMALIZE WEIGHTS
+    #############################################
     total = sum(abs(v) for v in betas.values())
 
     weights = {k: abs(v)/total for k, v in betas.items()}
 
-    # -----------------------------------
-    # BUILD WEIGHTED COMPOSITE
-    # -----------------------------------
+    #############################################
+    # 8. BUILD RAW PITCH GRADE AND PITCHGRADE+
+    #############################################
     df["Pitch_Grade_raw"] = sum(
         weights[col] * df[col] for col in feature_cols
     )
 
-    # -----------------------------------
-    # RESCALE TO 100 = LEAGUE AVG
-    # -----------------------------------
     mean = df["Pitch_Grade_raw"].mean()
     std  = df["Pitch_Grade_raw"].std()
 
@@ -982,15 +976,9 @@ def calculate_pitch_composite_score():
         (df["Pitch_Grade_raw"] - mean) / std
     )
 
-    # -----------------------------------
-    # Diagnostics Columns
-    # -----------------------------------
-    for col in feature_cols:
-        df[f"{col}_Component"] = df[col]
-
-    # -----------------------------------
-    # Save to Database
-    # -----------------------------------
+    #############################################
+    # 9. SAVE TO DUCKDB
+    #############################################
     con.register("pitch_grade_df", df)
 
     con.execute("""
@@ -1001,6 +989,9 @@ def calculate_pitch_composite_score():
     print("Pitch Grade model complete.")
     con.close()
 
+#############################################
+# 7. CALCULATE PITCH STUFF+
+#############################################
 def calculate_stuff_plus():
     #############################################
     # 1. LOAD DATA
@@ -1210,6 +1201,9 @@ def calculate_stuff_plus():
     print("Physics-Based Stuff+ (Full Arsenal) Complete")
     con.close()
 
+#############################################
+# 8. BUILD FULL PITCHING MODEL
+#############################################
 def compile_full_pitch_model():
     con = duckdb.connect("pitch_design.db")
 
@@ -1299,7 +1293,9 @@ def compile_full_pitch_model():
     #Close db connection
     con.close()
 
-#Run Main Function
+#############################################
+# MAIN FUNCTION
+#############################################
 if __name__ == '__main__':
     calculate_whiff_plus()
     calculate_contact_plus()

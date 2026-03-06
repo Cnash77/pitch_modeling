@@ -6,137 +6,11 @@ from sklearn.preprocessing import StandardScaler
 from itertools import combinations
 from sklearn.linear_model import RidgeCV
 
-def pitcher_season_stats():
-    #############################################
-    # SETTINGS
-    #############################################
-
-    START_YEAR = 2021
-    END_YEAR = 2025
-
-    #############################################
-    # CONNECT
-    #############################################
-
-    con = duckdb.connect("pitch_design.db")
-
-    #############################################
-    # PULL OFFICIAL DATA
-    #############################################
-
-    print("Pulling FanGraphs pitching data...")
-
-    pitcher_season = pitching_stats(
-        START_YEAR,
-        END_YEAR,
-        qual=0
-    )
-
-    #############################################
-    # CLEAN / STANDARDIZE
-    #############################################
-
-    pitcher_season = pitcher_season.rename(columns={
-        "Name": "player_name",
-        "Season": "game_year",
-        "Team": "team",
-        "IP": "innings_pitched",
-        "K%": "K_percent",
-        "BB%": "BB_percent",
-        "HR": "home_runs",
-        "SO": "strikeouts",
-        "BB": "walks",
-        "HBP": "hbp"
-    })
-
-    # Ensure numeric
-    numeric_cols = [
-        "innings_pitched","ERA","FIP","xFIP","WAR",
-        "K_percent","BB_percent",
-        "home_runs","strikeouts","walks","hbp"
-    ]
-
-    for col in numeric_cols:
-        if col in pitcher_season.columns:
-            pitcher_season[col] = pd.to_numeric(
-                pitcher_season[col],
-                errors="coerce"
-            )
-
-    #############################################
-    # CREATE ERA+ AND FIP+
-    #############################################
-
-    # League ERA by season (IP-weighted)
-    league_era = (
-        pitcher_season
-        .groupby("game_year")
-        .apply(lambda x:
-            (x["ERA"] * x["innings_pitched"]).sum()
-            / x["innings_pitched"].sum()
-        )
-        .reset_index(name="league_ERA")
-    )
-
-    pitcher_season = pitcher_season.merge(
-        league_era,
-        on="game_year",
-        how="left"
-    )
-
-    pitcher_season["ERA_plus"] = (
-        100 * pitcher_season["league_ERA"]
-        / pitcher_season["ERA"]
-    )
-
-    # League FIP by season (IP-weighted)
-    league_fip = (
-        pitcher_season
-        .groupby("game_year")
-        .apply(lambda x:
-            (x["FIP"] * x["innings_pitched"]).sum()
-            / x["innings_pitched"].sum()
-        )
-        .reset_index(name="league_FIP")
-    )
-
-    pitcher_season = pitcher_season.merge(
-        league_fip,
-        on="game_year",
-        how="left"
-    )
-
-    pitcher_season["FIP_plus"] = (
-        100 * pitcher_season["league_FIP"]
-        / pitcher_season["FIP"]
-    )
-
-    #############################################
-    # OPTIONAL SAMPLE FILTER
-    #############################################
-
-    pitcher_season = pitcher_season[
-        pitcher_season["innings_pitched"] >= 30
-    ]
-
-    #############################################
-    # SAVE TO DUCKDB
-    #############################################
-
-    con.register("season_df", pitcher_season)
-
-    con.execute("""
-    CREATE OR REPLACE TABLE pitcher_season_stats AS
-    SELECT *
-    FROM season_df
-    """)
-
-    print("\nOfficial pitcher_season_stats created\n")
-    print(pitcher_season.head())
-
-    con.close()
-
+#############################################
+# 1. CALCULATE PITCHER CLUTCH
+#############################################
 def pitcher_clutch():
+    
     #############################################
     # 1. LOAD DATA
     #############################################
@@ -207,7 +81,7 @@ def pitcher_clutch():
         .reset_index()
     )
 
-    # Optional: remove low-sample states
+    # Remove low-sample states
     we_table = we_table[we_table["samples"] >= 50]
 
     #############################################
@@ -229,9 +103,6 @@ def pitcher_clutch():
     # Update score diff after pitch
     data["runs_scored"] = data["bat_score"].diff().fillna(0)
     data["score_diff_after"] = data["score_diff"] - data["runs_scored"]
-
-    # For simplicity we keep same outs/base state after pitch
-    # (You can expand this with true post-pitch state logic)
 
     data = data.merge(
         we_table,
@@ -309,7 +180,7 @@ def pitcher_clutch():
     )
 
     #############################################
-    # 12. SAVE
+    # 12. SAVE TO DUCKDB
     #############################################
 
     con.register("clutch_df", clutch)
@@ -325,6 +196,9 @@ def pitcher_clutch():
 
     con.close()
 
+#############################################
+# 2. CALCULATE ARSENAL PLUS
+#############################################
 def arsenal_plus():
 
     #############################################
@@ -350,7 +224,7 @@ def arsenal_plus():
     """).df()
 
     #############################################
-    # 2. BUILD xwOBA TARGET (RUN PREVENTION)
+    # 2. BUILD xwOBA TARGET
     #############################################
 
     xwoba_data = pitch_data[
@@ -516,7 +390,7 @@ def arsenal_plus():
     )
 
     #############################################
-    # 9. LEARN INTERACTION WEIGHTS (RIDGE)
+    # 9. LEARN INTERACTION WEIGHTS
     #############################################
 
     interaction_features = [
@@ -583,7 +457,7 @@ def arsenal_plus():
     ]
 
     #############################################
-    # 12. TRAIN K+ MODEL (RIDGE CV)
+    # 12. TRAIN K+ MODEL
     #############################################
 
     ridge_k = RidgeCV(alphas=alphas, cv=5)
@@ -602,7 +476,7 @@ def arsenal_plus():
         print(f"{name}: {coef:.4f}")
 
     #############################################
-    # 13. TRAIN DESIGN+ MODEL (RIDGE CV)
+    # 13. TRAIN DESIGN+ MODEL 
     #############################################
 
     ridge_d = RidgeCV(alphas=alphas, cv=5)
@@ -662,6 +536,9 @@ def arsenal_plus():
                 
     con.close()
 
+#############################################
+# 3. CALCULATE RELIEF RUN PREVENTION PLUS
+#############################################
 def relief_run_prevention_plus():
     #############################################
     # 1. LOAD DATA
@@ -671,7 +548,7 @@ def relief_run_prevention_plus():
     data = con.sql("SELECT * FROM raw_statcast").df()
 
     #############################################
-    # 2. BUILD GAME STATE FEATURES (FULL DATA)
+    # 2. BUILD GAME STATE FEATURES
     #############################################
 
     # Base state (0–7 encoding)
@@ -764,7 +641,7 @@ def relief_run_prevention_plus():
     we_table = we_table[we_table["samples"] >= 50]
 
     #############################################
-    # 5. IDENTIFY RELIEVERS (<20% STARTS)
+    # 5. IDENTIFY RELIEVERS (<20% 0F APPEARANCES ARE STARTS)
     #############################################
 
     # Create appearance_id first
@@ -773,8 +650,7 @@ def relief_run_prevention_plus():
         data["pitcher"].astype(str)
     )
 
-    #A. IDENTIFY STARTS (1ST INNING APPEARANCE)
-    #A start = pitcher throws in inning 1
+    # Start = pitcher throws in inning 1
     first_inning_apps = (
         data[data["inning"] == 1]
         .groupby(["pitcher","game_year","game_pk"])
@@ -790,14 +666,14 @@ def relief_run_prevention_plus():
         .reset_index()
     )
 
-    # B. COUNT TOTAL APPEARANCES
+    # COUNT TOTAL APPEARANCES
     appearances_per_year = (
         data.groupby(["pitcher","game_year"])
         .agg(total_appearances=("game_pk","nunique"))
         .reset_index()
     )
 
-    #C. MERGE + CALCULATE START %
+    # MERGE + CALCULATE START %
     usage = appearances_per_year.merge(
         starts_per_year,
         on=["pitcher","game_year"],
@@ -811,12 +687,12 @@ def relief_run_prevention_plus():
         usage["total_appearances"]
     )
 
-    #D. DEFINE RELIEVERS
+    # DEFINE RELIEVERS
     relievers = usage[
         usage["start_pct"] < 0.20
     ][["pitcher","game_year"]]
 
-    #E.FILTER DATASET
+    # FILTER DATASET
     relief = data.merge(
         relievers,
         on=["pitcher","game_year"],
@@ -956,14 +832,10 @@ def relief_run_prevention_plus():
 
     rrp["RRP_plus"] = 100 + 10 * rrp["z_score"]
 
-    #############################################
-    # 14. MINIMUM SAMPLE FILTER
-    #############################################
-
     rrp = rrp[rrp["relief_pitches"] >= 300]
 
     #############################################
-    # 15. SAVE OUTPUT
+    # 14. SAVE OUTPUT
     #############################################
 
     con.register("rrp_df", rrp)
@@ -979,6 +851,9 @@ def relief_run_prevention_plus():
 
     con.close()
 
+#############################################
+# 4. COMPILE FULL PITCHER MODEL
+#############################################
 def compile_full_pitcher_model():
     con = duckdb.connect("pitch_design.db")
 
@@ -1037,13 +912,12 @@ def compile_full_pitcher_model():
 
 
     con.execute("COPY (SELECT * FROM pitcher_advanced_model_pitches) TO 'pitcher_advanced_model.csv' (HEADER, DELIMITER ',');")
-
-    #Close db connection
     con.close()
 
-#Run Main Function
+#############################################
+# MAIN FUNCTION
+#############################################
 if __name__ == '__main__':
-    pitcher_season_stats()
     pitcher_clutch()
     arsenal_plus()
     relief_run_prevention_plus()
