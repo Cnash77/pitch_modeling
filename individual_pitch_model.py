@@ -1287,9 +1287,9 @@ def compile_full_pitch_model():
     ORDER BY rs.pitcher, rs.season DESC, usage_rate DESC;""")
 
 
-    con.execute("COPY (SELECT * FROM pitcher_advanced_model_pitches) TO 'pitcher_summarized_data.csv' (HEADER, DELIMITER ',');")
+    con.execute("COPY (SELECT * FROM pitcher_advanced_model_pitches) TO 'pitch_level_model.csv' (HEADER, DELIMITER ',');")
 
-    print("Full pitch model completed. Full dataset is in pitcher_summarized_data.csv")
+    print("Full pitch model completed. Full dataset is in pitch_level_model.csv")
     #Close db connection
     con.close()
 

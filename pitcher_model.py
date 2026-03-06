@@ -911,7 +911,7 @@ def compile_full_pitcher_model():
     ORDER BY rs.pitcher, rs.season DESC, pss.innings_pitched DESC, rs.pitches_thrown DESC;""")
 
 
-    con.execute("COPY (SELECT * FROM pitcher_advanced_model_pitches) TO 'pitcher_advanced_model.csv' (HEADER, DELIMITER ',');")
+    con.execute("COPY (SELECT * FROM pitcher_advanced_model_pitches) TO 'pitcher_level_model.csv' (HEADER, DELIMITER ',');")
     con.close()
 
 #############################################
