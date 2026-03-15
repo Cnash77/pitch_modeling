@@ -213,7 +213,7 @@ def arsenal_plus():
     """).df()
 
     stuff = con.execute("""
-    SELECT pitcher, game_year, pitch_type, avg_stuff
+    SELECT pitcher, game_year, pitch_type, stuff_value
     FROM pitcher_stuff
     """).df()
 
@@ -275,8 +275,8 @@ def arsenal_plus():
         .agg(
             usage=("pitch_type","count"),
             avg_velo=("release_speed","mean"),
-            avg_ivb=("api_break_z_with_gravity","mean"),
-            avg_hb=("api_break_x_batter_in","mean"),
+            avg_ivb=("pfx_z","mean"),
+            avg_hb=("pfx_x","mean"),
             avg_vaa=("VAA","mean")
         )
         .reset_index()
@@ -290,7 +290,9 @@ def arsenal_plus():
         how="left"
     )
 
-    pitch_profile = pitch_profile.dropna(subset=["avg_stuff"])
+    pitch_profile = pitch_profile.dropna(subset=["stuff_value"])
+    pitch_profile["avg_ivb"] = pitch_profile["avg_ivb"] * 12
+    pitch_profile["avg_hb"] = pitch_profile["avg_hb"] * 12
 
     #############################################
     # 5. USAGE-WEIGHTED STUFF BASE
@@ -306,7 +308,7 @@ def arsenal_plus():
     )
 
     pitch_profile["weighted_stuff"] = (
-        pitch_profile["avg_stuff"] * pitch_profile["usage_weight"]
+        pitch_profile["stuff_value"] * pitch_profile["usage_weight"]
     )
 
     base_arsenal = (
@@ -358,7 +360,7 @@ def arsenal_plus():
             ivb_total   += abs(row_i["avg_ivb"]  - row_j["avg_ivb"])  * weight
             hb_total    += abs(row_i["avg_hb"]   - row_j["avg_hb"])   * weight
             vaa_total   += abs(row_i["avg_vaa"]  - row_j["avg_vaa"])  * weight
-            stuff_total += abs(row_i["avg_stuff"] - row_j["avg_stuff"]) * weight
+            stuff_total += abs(row_i["stuff_value"] - row_j["stuff_value"]) * weight
 
         for a, b in combinations(scaled_shapes, 2):
             distances.append(np.linalg.norm(a - b))
@@ -380,6 +382,55 @@ def arsenal_plus():
     )
 
     #############################################
+    # ADVANCED ARSENAL FEATURES
+    #############################################
+
+    def compute_advanced_interactions(group):
+
+        if len(group) < 2:
+            return pd.Series({
+                "tunnel_score":0,
+                "velo_band":0,
+                "mirror_score":0
+            })
+
+        pitches = group.copy()
+
+        tunnel_total = 0
+        velo_band_total = 0
+        mirror_total = 0
+
+        for (i, row_i), (j, row_j) in combinations(pitches.iterrows(), 2):
+
+            weight = row_i["usage_weight"] * row_j["usage_weight"]
+
+            # movement difference
+            movement_diff = np.sqrt(
+                (row_i["avg_ivb"] - row_j["avg_ivb"])**2 +
+                (row_i["avg_hb"] - row_j["avg_hb"])**2
+            )
+
+            # release similarity proxy (using VAA similarity)
+            release_sim = 1 / (1 + abs(row_i["avg_vaa"] - row_j["avg_vaa"]))
+
+            # tunneling score
+            tunnel_total += release_sim * movement_diff * weight
+
+            # velocity band separation
+            velo_band_total += abs(row_i["avg_velo"] - row_j["avg_velo"]) * weight
+
+            # horizontal mirror
+            mirror_total += (
+                abs(row_i["avg_hb"] + row_j["avg_hb"])
+            ) * weight
+
+        return pd.Series({
+            "tunnel_score":tunnel_total,
+            "velo_band":velo_band_total,
+            "mirror_score":mirror_total
+        })
+
+    #############################################
     # 8. MERGE CORE FEATURES
     #############################################
 
@@ -389,8 +440,21 @@ def arsenal_plus():
         how="left"
     )
 
+    advanced_df = (
+    pitch_profile
+    .groupby(["pitcher","game_year"])
+    .apply(compute_advanced_interactions)
+    .reset_index()
+    )   
+
+    arsenal = arsenal.merge(
+        advanced_df,
+        on=["pitcher","game_year"],
+        how="left"
+    )
+
     #############################################
-    # 9. LEARN INTERACTION WEIGHTS
+    # 9 LEARN INTERACTION WEIGHTS
     #############################################
 
     interaction_features = [
@@ -404,7 +468,11 @@ def arsenal_plus():
     alphas = np.logspace(-3, 3, 50)
 
     ridge_int = RidgeCV(alphas=alphas, cv=5)
-    ridge_int.fit(arsenal[interaction_features], arsenal["base_score"])
+
+    ridge_int.fit(
+        arsenal[interaction_features],
+        arsenal["base_score"]
+    )
 
     arsenal["interaction_score_raw"] = ridge_int.predict(
         arsenal[interaction_features]
@@ -432,6 +500,15 @@ def arsenal_plus():
         arsenal["interaction_score_raw"] - interaction_pred
     )
 
+    feature_cols = [
+        "base_score",
+        "interaction_score",
+        "min_shape_distance",
+        "tunnel_score",
+        "velo_band",
+        "mirror_score"
+    ]
+
     print("Orthogonalization Complete")
 
     #############################################
@@ -453,7 +530,10 @@ def arsenal_plus():
     feature_cols = [
         "base_score",
         "interaction_score",
-        "min_shape_distance"
+        "min_shape_distance",
+        "tunnel_score",
+        "velo_band",
+        "mirror_score"
     ]
 
     #############################################
@@ -886,6 +966,9 @@ def compile_full_pitcher_model():
         pss.FIP,
         pss.FIP_plus,
         pss.SIERA,
+        pc.rv_z AS run_value,
+        pc.wpa_z AS win_probability_added,
+        pc.Clutch_Score,
         a.ArsenalK_plus,
         a.ArsenalDesign_plus,
         rrpp.relief_apps,
@@ -907,6 +990,7 @@ def compile_full_pitcher_model():
     INNER JOIN player_id_map p ON rs.pitcher = p.key_mlbam
     INNER JOIN pitcher_season_stats pss ON p.key_fangraphs = pss.IDfg AND rs.season = pss.game_year
     INNER JOIN arsenal_plus a ON p.key_mlbam = a.pitcher AND rs.season = a.game_year
+    INNER JOIN pitcher_clutch pc ON p.key_mlbam = pc.pitcher AND rs.season = pc.game_year
     LEFT JOIN relief_run_prevention_plus rrpp ON p.key_mlbam = rrpp.pitcher AND rs.season = rrpp.game_year
     ORDER BY rs.pitcher, rs.season DESC, pss.innings_pitched DESC, rs.pitches_thrown DESC;""")
 
@@ -918,7 +1002,7 @@ def compile_full_pitcher_model():
 # MAIN FUNCTION
 #############################################
 if __name__ == '__main__':
-    pitcher_clutch()
+    #pitcher_clutch()
     arsenal_plus()
-    relief_run_prevention_plus()
+    #relief_run_prevention_plus()
     compile_full_pitcher_model()

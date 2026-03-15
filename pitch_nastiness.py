@@ -2,6 +2,7 @@ import duckdb
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
 
 #############################################
 # 1. LOAD DATA
@@ -12,24 +13,27 @@ con = duckdb.connect("pitch_design.db")
 df = con.execute("""
 SELECT
     pitch_pk,
+    pitcher,
     player_name,
     pitch_type,
     pitch_name,
     game_year,
     description,
+    game_date, 
+    inning,
+    inning_topbot,
+    outs_when_up,
+    balls,
+    strikes,
     release_speed,
-    effective_speed,
     release_spin_rate,
+    release_pos_x,
+    release_pos_z,
     release_extension,
     pfx_x,
     pfx_z
 FROM raw_statcast
 WHERE release_speed >= 70
-AND description IN (
-    'swinging_strike',
-    'swinging_strike_blocked',
-    'called_strike'
-)
 AND pitch_type != 'FA'
 """).df()
 
@@ -39,83 +43,72 @@ print(f"Loaded {len(df):,} pitches")
 # 2. FEATURE ENGINEERING
 #############################################
 
-# Absolute movement
-df["abs_vert_break"]  = df["pfx_z"].abs()
-df["abs_horiz_break"] = df["pfx_x"].abs()
+# Raw movement stats
+df["ivb"] = df["pfx_z"] * 12
+df["hb"]  = df["pfx_x"] * 12
+df["ivb_abs"] = abs(df["ivb"])
+df["hb_abs"] = abs(df["hb"])
+df["spin"] = df["release_spin_rate"]
 
-features = [
-    "release_speed",
-    "abs_vert_break",
-    "abs_horiz_break",
-    "release_spin_rate",
-    "release_extension"
+# Calculate movement features
+df["expected_movement"] = df["spin"] * 0.0005
+df["movement_total"] = np.sqrt(df["ivb"]**2 + df["hb"]**2)
+df["movement_over_expected"] = df["movement_total"] - df["expected_movement"]
+df["movement_gap"] = abs(df["movement_total"] - df["spin"] * 0.0005)
+df["movement_sep"] = abs(df["ivb_abs"] - df["hb_abs"]) * 1.2
+
+# Movement direction
+df["movement_angle"] = np.degrees(
+    np.arctan2(df["ivb"], df["hb"])
+)
+
+# Target flag for nasty outcomes
+df["is_good_outcome"] = df["description"].isin([
+    "swinging_strike",
+    "swinging_strike_blocked",
+    "called_strike",
+    "foul_tip"
+]).astype(int)
+
+#############################################
+# 3. SHAPE NASTINESS VIA PCA
+#############################################
+
+shape_features = [
+    "ivb_abs",
+    "hb_abs",
+    "movement_total",
+    "movement_gap",
+    "movement_sep",
+    "movement_angle",
+    "movement_over_expected"
 ]
 
-df = df.dropna(subset=features + ["pitch_type"])
+# Drop bad data
+df = df.dropna(subset=shape_features).copy()
 
+scaler = StandardScaler()
+Z = scaler.fit_transform(df[shape_features])
+
+pca = PCA(n_components=3)
+components = pca.fit_transform(Z)
+
+df["nastiness_raw"] = np.sqrt(
+    components[:,0]**2 +
+    components[:,1]**2 +
+    components[:,2]**2
+)
+
+df = df[df["is_good_outcome"] == 1].copy()
+
+print(f"\nFiltered to nasty outcomes: {len(df):,} pitches testing")
 #############################################
-# 3. DEFINE PITCH FAMILIES
-#############################################
-
-fastballs = ["FF", "SI", "FC"]
-breaking  = ["SL", "CU", "KC", "ST", "SV", "CS", "KN"]
-offspeed  = ["CH", "FS", "SC", "FO"]
-
-def pitch_family(pt):
-    if pt in fastballs:
-        return "fastball"
-    elif pt in breaking:
-        return "breaking"
-    elif pt in offspeed:
-        return "offspeed"
-    else:
-        return "other"
-
-df["pitch_family"] = df["pitch_type"].apply(pitch_family)
-
-#############################################
-# 4. FAMILY-RELATIVE MAHALANOBIS
+# 4. CALCULATE NASTINESS+
 #############################################
 
-df["nastiness_raw"] = np.nan
-
-for fam in df["pitch_family"].unique():
-
-    fam_df = df[df["pitch_family"] == fam].copy()
-
-    if len(fam_df) < 1000:
-        continue
-
-    print(f"Processing {fam} ({len(fam_df):,} pitches)")
-
-    X = fam_df[features]
-
-    # Standardize within family
-    scaler = StandardScaler()
-    Z = scaler.fit_transform(X)
-
-    # Covariance matrix
-    cov_matrix = np.cov(Z.T)
-
-    # Stabilize inversion
-    cov_matrix += np.eye(cov_matrix.shape[0]) * 1e-6
-
-    inv_cov = np.linalg.inv(cov_matrix)
-
-    # Mahalanobis distance
-    distances = np.sqrt(np.sum(Z @ inv_cov * Z, axis=1))
-
-    df.loc[fam_df.index, "nastiness_raw"] = distances
-
-#############################################
-# 5. LEAGUE-WIDE CALCULATING NASTINESS+
-#############################################
-
-mean = df["nastiness_raw"].mean()
-std  = df["nastiness_raw"].std()
-
-df["Nastiness_plus"] = 100 + 10 * (
-    (df["nastiness_raw"] - mean) / std
+df["Nastiness_plus"] = (
+    df["nastiness_raw"]
+    .transform(lambda x: 100 + 10 * ((x - x.mean()) / x.std()))
 )
 
 print("\nNastiness+ Distribution")
@@ -123,7 +116,7 @@ print("Mean:", round(df["Nastiness_plus"].mean(),2))
 print("Std:", round(df["Nastiness_plus"].std(),2))
 
 #############################################
-# 6. SAVE FULL NASTINESS+ TABLE
+# 6. SAVE FULL TABLE
 #############################################
 
 con.register("nastiness_df", df)
@@ -135,11 +128,10 @@ con.execute("""
 """)
 
 #############################################
-# 7. EXPORT 2025 NASTINESS+
+# 7. EXPORT 2025 RESULTS
 #############################################
 
-df_2025 = df[df["game_year"] == 2025]
-df_2025.to_csv("pitch_nastiness_model.csv", index=False)
+con.execute("COPY (SELECT * FROM pitch_nastiness WHERE game_year = 2025 ORDER BY Nastiness_plus DESC LIMIT 200) TO 'pitch_nastiness_model.csv' (HEADER, DELIMITER ',');")
 
 print("\nDirectional Nastiness model complete.\n")
 

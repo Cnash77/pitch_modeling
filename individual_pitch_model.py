@@ -8,188 +8,89 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error
 from xgboost import XGBClassifier
 from sklearn.metrics import roc_auc_score
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import StandardScaler
 
 #############################################
 # 1. CALCULATE WHIFF+
 #############################################
 def calculate_whiff_plus():
 
+    #############################################
+    # 1 CONNECT TO DB
+    #############################################
+
     con = duckdb.connect("pitch_design.db")
 
-    data = con.execute("""
-    SELECT
-        pitcher,
-        game_year,
-        pitch_type,
-        stand,
-        p_throws,
-        balls,
-        strikes,
-        plate_x,
-        plate_z,
-        sz_top,
-        sz_bot,
-        release_speed,
-        effective_speed,
-        release_spin_rate,
-        pfx_x,
-        pfx_z,
-        release_pos_x,
-        release_pos_y,
-        release_pos_z,
-        arm_angle,
-        release_extension,
-        api_break_z_with_gravity,
-        api_break_x_arm,
-        api_break_x_batter_in,
-        description
-    FROM raw_statcast
+    #############################################
+    # 2 LOAD DATA
+    #############################################
+
+    df = con.execute("""
+        SELECT
+            pitcher,
+            pitch_type,
+            game_date,
+            swing_flag,
+            whiff_flag
+        FROM raw_statcast
+        WHERE pitch_type IS NOT NULL
     """).df()
 
-    data = data.dropna()
-
     #############################################
-    # 1. CREATE WHIFF AND SWING FLAGS
-    #############################################
-    data["is_whiff"] = data["description"].isin([
-        "swinging_strike",
-        "swinging_strike_blocked"
-    ]).astype(int)
-
-    data["is_swing"] = data["description"].isin([
-        "swinging_strike",
-        "swinging_strike_blocked",
-        "foul",
-        "foul_tip",
-        "hit_into_play"
-    ]).astype(int)
-
-    # Only model whiff conditional on swing
-    data = data[data["is_swing"] == 1].copy()
-
-    #############################################
-    # 2. FEATURE ENGINEERING
+    # 3 EXTRACT SEASON
     #############################################
 
-    # Handedness flags
-    data["is_RHP"] = (data["p_throws"] == "R").astype(int)
-    data["is_RHB"] = (data["stand"] == "R").astype(int)
-
-    # Normalize vertical location
-    data["zone_height_norm"] = (
-        (data["plate_z"] - data["sz_bot"]) /
-        (data["sz_top"] - data["sz_bot"])
-    )
-
-    features = [
-        # Shape
-        "release_speed",
-        "effective_speed",
-        "release_spin_rate",
-        "pfx_x",
-        "pfx_z",
-        "plate_z",
-        "release_extension",
-        "api_break_z_with_gravity",
-        "api_break_x_arm",
-        "api_break_x_batter_in",
-        
-        # Location
-        "plate_x",
-        "zone_height_norm",
-        
-        # Count context
-        "balls",
-        "strikes",
-        
-        # Handedness
-        "is_RHP",
-        "is_RHB"
-    ]
+    df["game_date"] = pd.to_datetime(df["game_date"])
+    df["game_year"] = df["game_date"].dt.year
 
     #############################################
-    # 3. INITALIZE PREDICTOR COLUMN
+    # 4 FILTER TO SWINGS
     #############################################
-    data["raw_whiff"] = np.nan
+
+    swings = df[df["swing_flag"] == 1].copy()
 
     #############################################
-    # TRAIN BY PITCH TYPE
+    # 5 CALCULATE WHIFF RATE
     #############################################
-    pitch_types = data["pitch_type"].unique()
 
-    for pitch in pitch_types:
-
-        pitch_df = data[data["pitch_type"] == pitch].copy()
-
-        if len(pitch_df) < 100:
-            continue
-
-        # Time-based split
-        train = pitch_df[pitch_df["game_year"] < pitch_df["game_year"].max()]
-        test  = pitch_df[pitch_df["game_year"] == pitch_df["game_year"].max()]
-
-        if len(test) < 50:
-            train = pitch_df.sample(frac=0.8, random_state=42)
-            test  = pitch_df.drop(train.index)
-
-        X_train = train[features]
-        y_train = train["is_whiff"]
-
-        X_test  = test[features]
-        y_test  = test["is_whiff"]
-
-        model = XGBClassifier(
-            n_estimators=400,
-            max_depth=4,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_lambda=2.0,
-            eval_metric="logloss"
+    pitch_whiff = (
+        swings
+        .groupby(["pitcher","game_year","pitch_type"])
+        .agg(
+            swings=("swing_flag","count"),
+            whiffs=("whiff_flag","sum")
         )
+        .reset_index()
+    )
 
-        model.fit(X_train, y_train)
-
-        auc = roc_auc_score(y_test, model.predict_proba(X_test)[:, 1])
-
-        # Predict for ALL swings of this pitch type
-        full_pred = model.predict_proba(pitch_df[features])[:, 1]
-
-        data.loc[pitch_df.index, "raw_whiff"] = full_pred
+    pitch_whiff["whiff_rate"] = pitch_whiff["whiffs"] / pitch_whiff["swings"]
 
     #############################################
-    # 5. GLOBAL SCALING
+    # 6 REMOVE SMALL SAMPLE
     #############################################
-    league_mean = data["raw_whiff"].mean()
-    league_std  = data["raw_whiff"].std()
 
-    data["Whiff_plus"] = (
-        100 + 10 * ((data["raw_whiff"] - league_mean) / league_std)
+    pitch_whiff = pitch_whiff[pitch_whiff["swings"] >= 20]
+
+    #############################################
+    # 7 LEAGUE NORMALIZATION
+    #############################################
+
+    pitch_whiff["Whiff_plus"] = (
+        pitch_whiff
+        .groupby(["game_year","pitch_type"])["whiff_rate"]
+        .transform(lambda x: 100 + 10*((x-x.mean())/x.std()))
     )
 
     #############################################
-    # 6. GROUP BY PITCHER, YEAR, AND PITCH TYPE
+    # 8 SAVE RESULTS
     #############################################
-    pitcher_whiff = (
-        data.groupby(["pitcher", "game_year", "pitch_type"])
-            .agg(
-                swings=("is_swing", "count"),
-                avg_whiff_plus=("Whiff_plus", "mean"),
-                avg_raw_whiff=("raw_whiff", "mean")
-            )
-            .reset_index()
-    )
 
-    pitcher_whiff = pitcher_whiff[pitcher_whiff["swings"] >= 50]
-
-    #############################################
-    # 7. SAVE TO DUCKDB
-    #############################################
-    con.register("pitcher_whiff_df", pitcher_whiff)
+    con.register("whiff_plus_df", pitch_whiff)
 
     con.execute("""
-    CREATE OR REPLACE TABLE pitcher_whiff AS
-    SELECT * FROM pitcher_whiff_df
+        CREATE OR REPLACE TABLE pitcher_whiff_plus AS
+        SELECT * FROM whiff_plus_df
     """)
 
     print("Whiff+ model complete.")
@@ -201,164 +102,87 @@ def calculate_whiff_plus():
 #############################################
 def calculate_contact_plus():
     #############################################
-    # 1. LOAD DATA
+    # 1 CONNECT TO DB
     #############################################
 
     con = duckdb.connect("pitch_design.db")
-    data = con.sql("SELECT * FROM raw_statcast").df()
 
     #############################################
-    # 2. DEFINE BALLS IN PLAY
+    # 2 LOAD DATA
     #############################################
 
-    bip_events = [
+    df = con.execute("""
+        SELECT
+            pitcher,
+            pitch_type,
+            game_date,
+            description,
+            estimated_woba_using_speedangle
+        FROM raw_statcast
+        WHERE pitch_type IS NOT NULL
+    """).df()
+
+    #############################################
+    # 3 EXTRACT SEASON
+    #############################################
+
+    df["game_date"] = pd.to_datetime(df["game_date"])
+    df["game_year"] = df["game_date"].dt.year
+
+    #############################################
+    # 4 FILTER TO CONTACT EVENTS
+    #############################################
+
+    CONTACT_EVENTS = [
         "hit_into_play",
         "hit_into_play_score",
         "hit_into_play_no_out"
     ]
 
-    data["is_bip"] = data["description"].isin(bip_events).astype(int)
-
-    # Restrict to contact events only
-    data_model = data[data["is_bip"] == 1].copy()
+    df = df[df["description"].isin(CONTACT_EVENTS)].copy()
 
     #############################################
-    # 3. TARGET VARIABLE
+    # 5 CALCULATE CONTACT QUALITY
     #############################################
 
-    # Must exist in dataset
-    TARGET = "estimated_woba_using_speedangle"
-
-    data_model = data_model.dropna(subset=[TARGET])
-
-    #############################################
-    # 4. FEATURE ENGINEERING
-    #############################################
-
-    # Normalize vertical location relative to strike zone
-    data_model["zone_height_norm"] = (
-        (data_model["plate_z"] - data_model["sz_bot"]) /
-        (data_model["sz_top"] - data_model["sz_bot"])
-    )
-
-    # Handedness flags
-    data_model["is_RHP"] = (data_model["p_throws"] == "R").astype(int)
-    data_model["is_RHB"] = (data_model["stand"] == "R").astype(int)
-
-    # Convert pitch_type to categorical
-    data_model["pitch_type"] = data_model["pitch_type"].astype("category")
-
-    #############################################
-    # 5. FEATURE SET
-    #############################################
-
-    contact_features = [
-        # Shape
-        "release_speed",
-        "effective_speed",
-        "release_spin_rate",
-        "pfx_x",
-        "pfx_z",
-        "plate_z",
-        "release_extension",
-        "api_break_z_with_gravity",
-        "api_break_x_arm",
-        "api_break_x_batter_in",
-        
-        # Location
-        "plate_x",
-        "zone_height_norm",
-        
-        # Count context
-        "balls",
-        "strikes",
-        
-        # Handedness
-        "is_RHP",
-        "is_RHB"
-    ]
-
-    data_model = data_model.dropna(subset=contact_features)
-
-    X = data_model[contact_features]
-    y = data_model[TARGET]
-
-    #############################################
-    # 6. TRAIN / TEST SPLIT
-    #############################################
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42
-    )
-
-    #############################################
-    # 7. TRAIN MODEL
-    #############################################
-
-    model = xgb.XGBRegressor(
-        n_estimators=400,
-        max_depth=5,
-        learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        enable_categorical=True,
-        random_state=42
-    )
-
-    model.fit(X_train, y_train)
-
-    #############################################
-    # 8. EVALUATE MODEL
-    #############################################
-
-    preds = model.predict(X_test)
-    rmse = np.sqrt(mean_squared_error(y_test, preds))
-
-    #############################################
-    # 9. GENERATE PITCH-LEVEL xContact
-    #############################################
-
-    data_model["xContact"] = model.predict(X)
-
-    #############################################
-    # 10. SCALE TO CONTACT+
-    #############################################
-
-    league_mean = data_model["xContact"].mean()
-    league_std = data_model["xContact"].std()
-
-    # Invert so higher = better (lower damage allowed)
-    data_model["Contact_plus"] = 100 - 10 * (
-        (data_model["xContact"] - league_mean) / league_std
-    )
-
-    #############################################
-    # 11. AGGREGATE TO PITCHER / PITCH TYPE / SEASON
-    #############################################
-
-    grouped = (
-        data_model
-        .groupby(["pitcher", "game_year", "pitch_type"])
+    contact_quality = (
+        df.groupby(["pitcher","game_year","pitch_type"])
         .agg(
-            bip=("is_bip", "count"),
-            avg_xContact=("xContact", "mean"),
-            Contact_plus=("Contact_plus", "mean")
+            contacts=("description","count"),
+            contact_woba=("estimated_woba_using_speedangle","mean")
         )
         .reset_index()
     )
 
     #############################################
-    # 12. SAVE OUTPUT
+    # 6 REMOVE SMALL SAMPLES
     #############################################
 
-    con.register("grouped_df", grouped)
+    contact_quality = contact_quality[contact_quality["contacts"] >= 10]
+
+    #############################################
+    # 7 NORMALIZE INTO CONTACT+
+    #############################################
+
+    contact_quality["Contact_plus"] = (
+        contact_quality
+        .groupby(["game_year","pitch_type"])["contact_woba"]
+        .transform(lambda x: 100 - 10*((x-x.mean())/x.std()))
+    )
+
+    #############################################
+    # 8 SAVE RESULTS
+    #############################################
+
+    con.register("contact_plus_df", contact_quality)
 
     con.execute("""
-    CREATE OR REPLACE TABLE contact_plus AS
-    SELECT * FROM grouped_df
+        CREATE OR REPLACE TABLE pitcher_contact_plus AS
+        SELECT * FROM contact_plus_df
     """)
 
     print("Contact+ model complete.")
+
     con.close()
 
 #############################################
@@ -366,843 +190,786 @@ def calculate_contact_plus():
 #############################################
 def calculate_strike_plus():
     #############################################
-    # 1. LOAD DATA
+    # 1. CONNECT TO DB
     #############################################
 
     con = duckdb.connect("pitch_design.db")
-    data = con.sql("SELECT * FROM raw_statcast").df()
 
     #############################################
-    # 2. BUILD STRIKE TARGET
+    # 2. LOAD DATA
     #############################################
 
-    strike_events = [
+    df = con.execute("""
+        SELECT
+            pitcher,
+            pitch_type,
+            game_date,
+            description
+        FROM raw_statcast
+        WHERE pitch_type IS NOT NULL
+    """).df()
+
+    #############################################
+    # 3. EXTRACT SEASON
+    #############################################
+
+    df["game_date"] = pd.to_datetime(df["game_date"])
+    df["game_year"] = df["game_date"].dt.year
+
+    #############################################
+    # 4. DEFINE STRIKE EVENTS
+    #############################################
+
+    STRIKE_EVENTS = [
         "called_strike",
         "swinging_strike",
         "swinging_strike_blocked",
         "foul",
-        "foul_tip",
-        "hit_into_play",
-        "hit_into_play_score",
-        "hit_into_play_no_out"
+        "foul_tip"
     ]
 
-    data["is_strike"] = data["description"].isin(strike_events).astype(int)
+    df["is_strike"] = df["description"].isin(STRIKE_EVENTS).astype(int)
 
     #############################################
-    # 3. FEATURE ENGINEERING
+    # 5. CALCULATE STRIKE RATE
     #############################################
 
-    # Normalize vertical location relative to zone
-    data["zone_height_norm"] = (
-        (data["plate_z"] - data["sz_bot"]) /
-        (data["sz_top"] - data["sz_bot"])
-    )
-
-    # Handedness flags
-    data["is_RHP"] = (data["p_throws"] == "R").astype(int)
-    data["is_RHB"] = (data["stand"] == "R").astype(int)
-
-    # Convert pitch_type to categorical
-    data["pitch_type"] = data["pitch_type"].astype("category")
-
-    #############################################
-    # 4. FEATURE SET
-    #############################################
-
-    strike_features = [
-        # Shape
-        "release_speed",
-        "effective_speed",
-        "release_spin_rate",
-        "pfx_x",
-        "pfx_z",
-        "plate_z",
-        "release_extension",
-        "api_break_z_with_gravity",
-        "api_break_x_arm",
-        "api_break_x_batter_in",
-        
-        # Location
-        "plate_x",
-        "zone_height_norm",
-        
-        # Count context
-        "balls",
-        "strikes",
-        
-        # Handedness
-        "is_RHP",
-        "is_RHB"
-    ]
-
-    data_model = data.dropna(subset=strike_features + ["is_strike"]).copy()
-
-    X = data_model[strike_features]
-    y = data_model["is_strike"]
-
-    #############################################
-    # 5. TRAIN / TEST SPLIT
-    #############################################
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42
-    )
-
-    #############################################
-    # 6. TRAIN MODEL
-    #############################################
-
-    model = xgb.XGBClassifier(
-        n_estimators=300,
-        max_depth=5,
-        learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        enable_categorical=True,
-        eval_metric="logloss",
-        random_state=42
-    )
-
-    model.fit(X_train, y_train)
-
-    #############################################
-    # 7. EVALUATE MODEL
-    #############################################
-
-    preds = model.predict_proba(X_test)[:, 1]
-    auc = roc_auc_score(y_test, preds)
-
-    #############################################
-    # 8. GENERATE PITCH-LEVEL EXPECTED STRIKE
-    #############################################
-
-    data_model["xStrike"] = model.predict_proba(X)[:, 1]
-
-    #############################################
-    # 9. SCALE TO STRIKE+
-    #############################################
-
-    league_mean = data_model["xStrike"].mean()
-    league_std = data_model["xStrike"].std()
-
-    data_model["Strike_plus"] = 100 + 10 * (
-        (data_model["xStrike"] - league_mean) / league_std
-    )
-
-    #############################################
-    # 10. AGGREGATE TO PITCHER / PITCH TYPE / SEASON
-    #############################################
-
-    grouped = (
-        data_model
-        .groupby(["pitcher", "game_year", "pitch_type"])
+    strike_rate = (
+        df.groupby(["pitcher","game_year","pitch_type"])
         .agg(
-            pitches=("is_strike", "count"),
-            avg_xStrike=("xStrike", "mean"),
-            Strike_plus=("Strike_plus", "mean")
+            pitches=("description","count"),
+            strikes=("is_strike","sum")
         )
         .reset_index()
     )
 
+    strike_rate["strike_rate"] = strike_rate["strikes"] / strike_rate["pitches"]
+
     #############################################
-    # 11. SAVE OUTPUT
+    # 6. REMOVE SMALL SAMPLES
     #############################################
 
-    con.register("grouped_df", grouped)
+    strike_rate = strike_rate[strike_rate["pitches"] >= 10]
+
+    #############################################
+    # 7. NORMALIZE INTO STRIKE+
+    #############################################
+
+    strike_rate["Strike_plus"] = (
+        strike_rate
+        .groupby(["game_year","pitch_type"])["strike_rate"]
+        .transform(lambda x: 100 + 10*((x-x.mean())/x.std()))
+    )
+
+    #############################################
+    # 8. SAVE RESULTS
+    #############################################
+
+    con.register("strike_plus_df", strike_rate)
 
     con.execute("""
-    CREATE OR REPLACE TABLE strike_plus AS
-    SELECT * FROM grouped_df
+        CREATE OR REPLACE TABLE pitcher_strike_plus AS
+        SELECT * FROM strike_plus_df
     """)
 
     print("Strike+ model complete.")
-    con.close()
 
+    con.close()
 #############################################
 # 4. CALCULATE BALL+
 #############################################
 def calculate_ball_plus():
     #############################################
-    # 1. LOAD DATA
+    # 1 CONNECT TO DATABASE
     #############################################
 
     con = duckdb.connect("pitch_design.db")
-    data = con.sql("SELECT * FROM raw_statcast").df()
 
     #############################################
-    # 2. BUILD SWING + TAKE FLAGS
+    # 2 LOAD DATA
     #############################################
 
-    swing_events = [
-        "swinging_strike",
-        "swinging_strike_blocked",
-        "foul",
-        "foul_tip",
-        "hit_into_play",
-        "hit_into_play_score",
-        "hit_into_play_no_out"
-    ]
-
-    data["is_swing"] = data["description"].isin(swing_events).astype(int)
-    data["is_take"] = 1 - data["is_swing"]
+    df = con.execute("""
+        SELECT
+            pitcher,
+            pitch_type,
+            game_date,
+            description
+        FROM raw_statcast
+        WHERE pitch_type IS NOT NULL
+    """).df()
 
     #############################################
-    # 3. BUILD BALL TARGET (TAKEN PITCHES ONLY)
+    # 3 EXTRACT SEASON
     #############################################
 
-    ball_events = [
+    df["game_date"] = pd.to_datetime(df["game_date"])
+    df["game_year"] = df["game_date"].dt.year
+
+    #############################################
+    # 4 DEFINE BALL EVENTS
+    #############################################
+
+    BALL_EVENTS = [
         "ball",
         "blocked_ball",
-        "intent_ball",
-        "pitchout"
+        "ball_in_dirt"
     ]
 
-    data["is_ball"] = data["description"].isin(ball_events).astype(int)
-
-    # Restrict to taken pitches only
-    data_model = data[data["is_take"] == 1].copy()
+    df["is_ball"] = df["description"].isin(BALL_EVENTS).astype(int)
 
     #############################################
-    # 4. FEATURE ENGINEERING
+    # 5 CALCULATE BALL RATE
     #############################################
 
-    # Normalize vertical zone location
-    data_model["zone_height_norm"] = (
-        (data_model["plate_z"] - data_model["sz_bot"]) /
-        (data_model["sz_top"] - data_model["sz_bot"])
-    )
-
-    # Handedness flags
-    data_model["is_RHP"] = (data_model["p_throws"] == "R").astype(int)
-    data_model["is_RHB"] = (data_model["stand"] == "R").astype(int)
-
-    # Categorical pitch type
-    data_model["pitch_type"] = data_model["pitch_type"].astype("category")
-
-    #############################################
-    # 5. FEATURE SET
-    #############################################
-
-    ball_features = [
-        # Shape
-        "release_speed",
-        "effective_speed",
-        "release_spin_rate",
-        "pfx_x",
-        "pfx_z",
-        "plate_z",
-        "release_extension",
-        "api_break_z_with_gravity",
-        "api_break_x_arm",
-        "api_break_x_batter_in",
-        
-        # Location
-        "plate_x",
-        "zone_height_norm",
-        
-        # Count context
-        "balls",
-        "strikes",
-        
-        # Handedness
-        "is_RHP",
-        "is_RHB"
-    ]
-
-    data_model = data_model.dropna(subset=ball_features + ["is_ball"])
-
-    X = data_model[ball_features]
-    y = data_model["is_ball"]
-
-    #############################################
-    # 6. TRAIN / TEST SPLIT
-    #############################################
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42
-    )
-
-    #############################################
-    # 7. TRAIN MODEL
-    #############################################
-
-    model = xgb.XGBClassifier(
-        n_estimators=300,
-        max_depth=5,
-        learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        enable_categorical=True,
-        eval_metric="logloss",
-        random_state=42
-    )
-
-    model.fit(X_train, y_train)
-
-    #############################################
-    # 8. EVALUATE
-    #############################################
-
-    preds = model.predict_proba(X_test)[:, 1]
-    auc = roc_auc_score(y_test, preds)
-
-    #############################################
-    # 9. GENERATE PITCH-LEVEL xBall
-    #############################################
-
-    data_model["xBall"] = model.predict_proba(X)[:, 1]
-
-    #############################################
-    # 10. SCALE TO BALL+
-    #############################################
-
-    league_mean = data_model["xBall"].mean()
-    league_std = data_model["xBall"].std()
-
-    # Inverted so higher = better (fewer balls)
-    data_model["Ball_plus"] = 100 - 10 * (
-        (data_model["xBall"] - league_mean) / league_std
-    )
-
-    #############################################
-    # 11. AGGREGATE TO PITCHER / PITCH TYPE / SEASON
-    #############################################
-
-    grouped = (
-        data_model
-        .groupby(["pitcher", "game_year", "pitch_type"])
+    ball_rate = (
+        df.groupby(["pitcher","game_year","pitch_type"])
         .agg(
-            pitches=("is_ball", "count"),
-            avg_xBall=("xBall", "mean"),
-            Ball_plus=("Ball_plus", "mean")
+            pitches=("description","count"),
+            balls=("is_ball","sum")
         )
         .reset_index()
     )
 
+    ball_rate["ball_rate"] = ball_rate["balls"] / ball_rate["pitches"]
+
     #############################################
-    # 12. SAVE OUTPUT
+    # 6 REMOVE SMALL SAMPLES
     #############################################
 
-    con.register("grouped_df", grouped)
+    ball_rate = ball_rate[ball_rate["pitches"] >= 10]
+
+    #############################################
+    # 7 NORMALIZE INTO BALL+
+    #############################################
+
+    ball_rate["Ball_plus"] = (
+        ball_rate
+        .groupby(["game_year","pitch_type"])["ball_rate"]
+        .transform(lambda x: 100 - 10*((x-x.mean())/x.std()))
+    )
+
+    #############################################
+    # 8 SAVE RESULTS
+    #############################################
+
+    con.register("ball_plus_df", ball_rate)
 
     con.execute("""
-    CREATE OR REPLACE TABLE ball_plus AS
-    SELECT * FROM grouped_df
+        CREATE OR REPLACE TABLE pitcher_ball_plus AS
+        SELECT * FROM ball_plus_df
     """)
 
     print("Ball+ model complete.")
+
     con.close()
 
 #############################################
-# 5. CALCULATE SWING+
+# 5. CALCULATE CHASE+
 #############################################
-def calculate_swing_plus():
+def calculate_chase_plus():
     #############################################
-    # 1. LOAD DATA
+    # 1 CONNECT TO DB
     #############################################
 
     con = duckdb.connect("pitch_design.db")
-    data = con.sql("SELECT * FROM raw_statcast").df()
 
     #############################################
-    # 2. BUILD SWING TARGET
+    # 2 LOAD DATA
     #############################################
 
-    swing_events = [
-        "swinging_strike",
-        "swinging_strike_blocked",
-        "foul",
-        "foul_tip",
-        "hit_into_play",
-        "hit_into_play_score",
-        "hit_into_play_no_out"
-    ]
-
-    data["is_swing"] = data["description"].isin(swing_events).astype(int)
-
-    #############################################
-    # 3. FEATURE ENGINEERING
-    #############################################
-
-    # Normalize vertical location inside strike zone
-    data["zone_height_norm"] = (
-        (data["plate_z"] - data["sz_bot"]) /
-        (data["sz_top"] - data["sz_bot"])
-    )
-
-    # Handedness flags
-    data["is_RHP"] = (data["p_throws"] == "R").astype(int)
-    data["is_RHB"] = (data["stand"] == "R").astype(int)
-
-    # Keep original pitch_type but convert to category
-    data["pitch_type"] = data["pitch_type"].astype("category")
+    df = con.execute("""
+        SELECT
+            pitcher,
+            pitch_type,
+            game_date,
+            zone,
+            swing_flag
+        FROM raw_statcast
+        WHERE pitch_type IS NOT NULL
+    """).df()
 
     #############################################
-    # 4. FEATURE SET
+    # 3 EXTRACT SEASON
     #############################################
 
-    swing_features = [
-        "release_speed",
-        "release_spin_rate",
-        "pfx_x",
-        "pfx_z",
-        "plate_x",
-        "zone_height_norm",
-        "balls",
-        "strikes",
-        "is_RHP",
-        "is_RHB",
-        "pitch_type"
-    ]
-
-    data_model = data.dropna(subset=swing_features + ["is_swing"]).copy()
-
-    X = data_model[swing_features]
-    y = data_model["is_swing"]
+    df["game_date"] = pd.to_datetime(df["game_date"])
+    df["game_year"] = df["game_date"].dt.year
 
     #############################################
-    # 5. TRAIN / TEST SPLIT
+    # 4 IDENTIFY OUT OF ZONE PITCHES
     #############################################
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42
-    )
+    df["out_of_zone"] = df["zone"] > 9
 
     #############################################
-    # 6. TRAIN MODEL
+    # 5 FILTER TO PITCHES OUTSIDE THE ZONE
     #############################################
 
-    model = xgb.XGBClassifier(
-        n_estimators=300,
-        max_depth=5,
-        learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        enable_categorical=True,
-        eval_metric="logloss",
-        random_state=42
-    )
-
-    model.fit(X_train, y_train)
+    oz = df[df["out_of_zone"] == True].copy()
 
     #############################################
-    # 7. EVALUATE
+    # 6 CALCULATE CHASE RATE
     #############################################
 
-    preds = model.predict_proba(X_test)[:, 1]
-    auc = roc_auc_score(y_test, preds)
-
-    print(f"Swing Model AUC: {auc:.4f}")
-
-    #############################################
-    # 8. GENERATE PITCH-LEVEL EXPECTED SWING
-    #############################################
-
-    data_model["xSwing"] = model.predict_proba(X)[:, 1]
-
-    #############################################
-    # 9. SCALE TO SWING+
-    #############################################
-
-    league_mean = data_model["xSwing"].mean()
-    league_std = data_model["xSwing"].std()
-
-    data_model["Swing_plus"] = 100 + 10 * (
-        (data_model["xSwing"] - league_mean) / league_std
-    )
-
-    #############################################
-    # 10. AGGREGATE TO PITCHER / PITCH TYPE / SEASON
-    #############################################
-
-    grouped = (
-        data_model
-        .groupby(["pitcher", "game_year", "pitch_type"])
+    chase = (
+        oz.groupby(["pitcher","game_year","pitch_type"])
         .agg(
-            pitches=("is_swing", "count"),
-            avg_xSwing=("xSwing", "mean"),
-            Swing_plus=("Swing_plus", "mean")
+            pitches_outside=("out_of_zone","count"),
+            chases=("swing_flag","sum")
         )
         .reset_index()
     )
 
+    chase["chase_rate"] = chase["chases"] / chase["pitches_outside"]
+
     #############################################
-    # 11. SAVE OUTPUT
+    # 7 REMOVE SMALL SAMPLES
     #############################################
 
-    con.register("grouped_df", grouped)
+    chase = chase[chase["pitches_outside"] >= 10]
+
+    #############################################
+    # 8 NORMALIZE INTO CHASE+
+    #############################################
+
+    chase["Chase_plus"] = (
+        chase
+        .groupby(["game_year","pitch_type"])["chase_rate"]
+        .transform(lambda x: 100 + 10*((x-x.mean())/x.std()))
+    )
+
+    #############################################
+    # 9 SAVE RESULTS
+    #############################################
+
+    con.register("chase_plus_df", chase)
 
     con.execute("""
-    CREATE OR REPLACE TABLE swing_plus AS
-    SELECT * FROM grouped_df
+        CREATE OR REPLACE TABLE pitcher_chase_plus AS
+        SELECT * FROM chase_plus_df
     """)
 
-    print("Swing+ model complete. Output saved to swing_plus.csv")
+    print("Chase+ model complete.")
+
     con.close()
 
 #############################################
 # 6. CALCULATE PITCHGRADE+
 #############################################
-def calculate_pitch_composite_score(): 
+def calculate_pitch_composite_score():
+
+        #############################################
+    # 1 CONNECT TO DATABASE
     #############################################
-    # 1. CONNECT TO DUCKDB
-    #############################################
+
     con = duckdb.connect("pitch_design.db")
 
     #############################################
-    # 2. LOAD METRICS AND MERGE INTO ONE DATAFRAME
+    # 2 LOAD METRIC TABLES
     #############################################
-    whiff = con.execute("""
-    SELECT
-        pitcher,
-        game_year,
-        pitch_type,
-        avg_whiff_plus AS Whiff_plus,
-        swings
-    FROM pitcher_whiff
-    """).df()
 
-    contact = con.execute("""
-    SELECT
-        pitcher,
-        game_year,
-        pitch_type,
-        Contact_plus,
-        bip,
-        avg_xContact
-    FROM contact_plus
-    """).df()
+    whiff = con.execute("SELECT pitcher, game_year, pitch_type, Whiff_plus FROM pitcher_whiff_plus").df()
+    contact = con.execute("SELECT pitcher, game_year, pitch_type, Contact_plus FROM pitcher_contact_plus").df()
+    chase = con.execute("SELECT pitcher, game_year, pitch_type, Chase_plus FROM pitcher_chase_plus").df()
+    strike = con.execute("SELECT pitcher, game_year, pitch_type, Strike_plus FROM pitcher_strike_plus").df()
+    ball = con.execute("SELECT pitcher, game_year, pitch_type, Ball_plus FROM pitcher_ball_plus").df()
 
-    swing = con.execute("""
-    SELECT
-        pitcher,
-        game_year,
-        pitch_type,
-        Swing_plus,
-        pitches AS swing_pitches
-    FROM swing_plus
-    """).df()
+    #############################################
+    # 3 MERGE ALL METRICS
+    #############################################
 
-    strike = con.execute("""
-    SELECT
-        pitcher,
-        game_year,
-        pitch_type,
-        Strike_plus,
-        pitches AS strike_pitches
-    FROM strike_plus
-    """).df()
+    df = whiff.merge(contact, on=["pitcher","game_year","pitch_type"], how="outer")
 
-    ball = con.execute("""
-    SELECT
-        pitcher,
-        game_year,
-        pitch_type,
-        Ball_plus,
-        pitches AS ball_pitches
-    FROM ball_plus
-    """).df()
+    df = df.merge(chase, on=["pitcher","game_year","pitch_type"], how="outer")
+    df = df.merge(strike, on=["pitcher","game_year","pitch_type"], how="outer")
+    df = df.merge(ball, on=["pitcher","game_year","pitch_type"], how="outer")
 
-    df = (
-        whiff
-        .merge(contact, on=["pitcher","game_year","pitch_type"], how="inner")
-        .merge(swing,   on=["pitcher","game_year","pitch_type"], how="inner")
-        .merge(strike,  on=["pitcher","game_year","pitch_type"], how="inner")
-        .merge(ball,    on=["pitcher","game_year","pitch_type"], how="inner")
+    #############################################
+    # 4 DROP MISSING VALUES
+    #############################################
+
+    df = df.dropna()
+
+    #############################################
+    # 5 BUILD WEIGHTED PITCH SCORE
+    #############################################
+
+    df["pitch_score"] = (
+
+        0.35 * df["Whiff_plus"]
+        + 0.30 * df["Contact_plus"]
+        + 0.15 * df["Chase_plus"]
+        + 0.15 * df["Strike_plus"]
+        + 0.05 * df["Ball_plus"]
+
     )
 
     #############################################
-    # 3. REMOVE SMALL SAMPLES
+    # 6 NORMALIZE INTO PITCHGRADE+
     #############################################
-    df = df[
-        (df["swings"] >= 50) &
-        (df["bip"] >= 25) &
-        (df["swing_pitches"] >= 100) &
-        (df["strike_pitches"] >= 100) &
-        (df["ball_pitches"] >= 100)
-    ]
 
-    #############################################
-    # 4. DEFINE TARGET
-    #############################################
-    TARGET = "avg_xContact"
-
-    df = df.dropna(subset=[TARGET]).copy()
-
-    #############################################
-    # 5. STANDARDIZE FEATURES
-    #############################################
-    feature_cols = [
-        "Whiff_plus",
-        "Contact_plus",
-        "Swing_plus",
-        "Strike_plus",
-        "Ball_plus"
-    ]
-
-    X = df[feature_cols]
-    y = df[TARGET]
-
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-
-    #############################################
-    # 6. BUILD LINEAR REGRESSION
-    #############################################
-    reg = LinearRegression()
-    reg.fit(X_scaled, y)
-
-    betas = dict(zip(feature_cols, reg.coef_))
-
-    #############################################
-    # 7. NORMALIZE WEIGHTS
-    #############################################
-    total = sum(abs(v) for v in betas.values())
-
-    weights = {k: abs(v)/total for k, v in betas.items()}
-
-    #############################################
-    # 8. BUILD RAW PITCH GRADE AND PITCHGRADE+
-    #############################################
-    df["Pitch_Grade_raw"] = sum(
-        weights[col] * df[col] for col in feature_cols
-    )
-
-    mean = df["Pitch_Grade_raw"].mean()
-    std  = df["Pitch_Grade_raw"].std()
-
-    df["Pitch_Grade"] = 100 + 10 * (
-        (df["Pitch_Grade_raw"] - mean) / std
+    df["PitchGrade_plus"] = (
+        df
+        .groupby(["game_year","pitch_type"])["pitch_score"]
+        .transform(lambda x: 100 + 10*((x-x.mean())/x.std()))
     )
 
     #############################################
-    # 9. SAVE TO DUCKDB
+    # 7 SAVE RESULTS
     #############################################
-    con.register("pitch_grade_df", df)
+
+    con.register("pitchgrade_plus_df", df)
 
     con.execute("""
     CREATE OR REPLACE TABLE pitch_grade AS
-    SELECT * FROM pitch_grade_df
+    SELECT * FROM pitchgrade_plus_df
     """)
 
     print("Pitch Grade model complete.")
+
     con.close()
 
 #############################################
-# 7. CALCULATE PITCH STUFF+
+# 7. CALCULATE STUFF+
 #############################################
 def calculate_stuff_plus():
     #############################################
-    # 1. LOAD DATA
+    # 1. CONNECT TO DUCKDB
     #############################################
 
     con = duckdb.connect("pitch_design.db")
-    data = con.execute("SELECT * FROM raw_statcast").df()
 
     #############################################
-    # 2. CREATE SWING DATASET (TRAINING ONLY)
+    # 2. LOAD PITCH LEVEL DATA
     #############################################
 
-    full_data = data.copy()
+    df = con.execute("""
+        SELECT
+            pitcher,
+            game_year,
+            pitch_type,
+            release_speed,
+            release_spin_rate,
+            pfx_x,
+            pfx_z,
+            release_pos_x,
+            release_pos_z,
+            release_extension,
+            stand,
+            p_throws,
+            description,
+            estimated_woba_using_speedangle
+        FROM raw_statcast
+        WHERE pitch_type IS NOT NULL
+    """).df()
 
-    swing_data = data[data["swing_flag"] == 1].copy()
-    swing_data["is_whiff"] = swing_data["whiff_flag"]
-
-    #############################################
-    # 3. COMPUTE APPROACH ANGLES (FULL DATA)
-    #############################################
-
-    for df in [full_data, swing_data]:
-
-        df["t_plate"] = -df["release_pos_y"] / df["vy0"]
-
-        df["vz_plate"] = df["vz0"] + df["az"] * df["t_plate"]
-        df["vy_plate"] = df["vy0"] + df["ay"] * df["t_plate"]
-        df["vx_plate"] = df["vx0"] + df["ax"] * df["t_plate"]
-
-        df["VAA"] = np.degrees(np.arctan(df["vz_plate"] / df["vy_plate"]))
-        df["HAA"] = np.degrees(np.arctan(df["vx_plate"] / df["vy_plate"]))
-
-        df = df[(df["VAA"] > -15) & (df["VAA"] < 5)]
-
-    #############################################
-    # 4. FEATURE SELECTION
-    #############################################
-
-    cols = [
-        "pitcher","game_year","pitch_type",
-        "stand","p_throws",
-        "release_speed","release_spin_rate",
-        "release_extension","release_pos_z",
-        "arm_angle",
-        "api_break_z_with_gravity",
-        "api_break_x_batter_in",
-        "plate_x","plate_z",
-        "VAA","HAA"
+    NASTY_EVENTS = [
+    "swinging_strike",
+    "swinging_strike_blocked",
+    "called_strike",
+    "foul",
+    "hit_into_play"
     ]
 
-    full_data = full_data[cols].dropna()
-    swing_data = swing_data[cols + ["is_whiff"]].dropna()
-
-    #############################################
-    # 5. FEATURE ENGINEERING (BOTH DATASETS)
-    #############################################
-
-    def engineer_features(df):
-
-        df["is_RHP"] = (df["p_throws"] == "R").astype(int)
-        df["is_RHB"] = (df["stand"] == "R").astype(int)
-
-        family_map = {
-            "FF": "FB", "SI": "FB", "FC": "FB", "FA": "FB",
-            "SL": "BB", "ST": "BB", "CU": "BB", "KC": "BB",
-            "CH": "OS", "FS": "OS", "FO": "OS", "SV": "OS"
-        }
-
-        df["pitch_family"] = df["pitch_type"].map(family_map)
-        df = df.dropna(subset=["pitch_family"])
-
-        df["velo_diff"] = (
-            df["release_speed"]
-            - df.groupby(["pitcher","game_year"])["release_speed"].transform("mean")
-        )
-
-        df["ivb_diff"] = (
-            df["api_break_z_with_gravity"]
-            - df.groupby(["pitcher","game_year"])["api_break_z_with_gravity"].transform("mean")
-        )
-
-        df["hb_diff"] = (
-            df["api_break_x_batter_in"]
-            - df.groupby(["pitcher","game_year"])["api_break_x_batter_in"].transform("mean")
-        )
-
-        df["ivb_per_mph"] = df["api_break_z_with_gravity"] / df["release_speed"]
-        df["hb_per_mph"] = df["api_break_x_batter_in"] / df["release_speed"]
-
-        mean_release_height = df["release_pos_z"].mean()
-        df["vaa_adj_height"] = (
-            df["VAA"] - 0.6 * (df["release_pos_z"] - mean_release_height)
-        )
-
-        df["x_sweep_interaction"] = df["plate_x"] * df["api_break_x_batter_in"]
-        df["z_vaa_interaction"] = df["plate_z"] * df["VAA"]
-
-        return df
-
-    full_data = engineer_features(full_data)
-    swing_data = engineer_features(swing_data)
-
-    #############################################
-    # 6. MODEL FEATURES
-    #############################################
-
-    features = [
-        "release_speed",
-        "release_spin_rate",
-        "release_extension",
-        "arm_angle",
-        "api_break_z_with_gravity",
-        "api_break_x_batter_in",
-        "VAA","HAA","vaa_adj_height",
-        "velo_diff","ivb_diff","hb_diff",
-        "ivb_per_mph","hb_per_mph",
-        "plate_x","plate_z",
-        "x_sweep_interaction","z_vaa_interaction",
-        "is_RHP","is_RHB"
+    df = df[
+        (df["release_speed"] >= 70) &
+        (df["description"].isin(NASTY_EVENTS))
     ]
 
-    #############################################
-    # 7. TRAIN PER FAMILY (ON SWINGS ONLY)
-    #############################################
-
-    full_data["raw_stuff"] = np.nan
-    full_data["Stuff_plus"] = np.nan
-
-    family_models = {}
-
-    for fam in swing_data["pitch_family"].unique():
-
-        fam_train = swing_data[swing_data["pitch_family"] == fam].copy()
-
-        if len(fam_train) < 200:
-            continue
-
-        X = fam_train[features]
-        y = fam_train["is_whiff"]
-
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42
-        )
-
-        model = XGBClassifier(
-            n_estimators=300,
-            max_depth=4,
-            learning_rate=0.03,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_lambda=3,
-            reg_alpha=1,
-            min_child_weight=5,
-            eval_metric="logloss",
-            random_state=42
-        )
-
-        model.fit(X_train, y_train)
-
-        preds = model.predict_proba(X_test)[:,1]
-        auc = roc_auc_score(y_test, preds)
-
-        # Score ALL pitches in that family
-        fam_all = full_data[full_data["pitch_family"] == fam].copy()
-        fam_all = fam_all.dropna(subset=features)
-
-        raw_pred_all = model.predict_proba(fam_all[features])[:,1]
-
-        mean = raw_pred_all.mean()
-        std = raw_pred_all.std()
-
-        full_data.loc[fam_all.index, "raw_stuff"] = raw_pred_all
-        full_data.loc[fam_all.index, "Stuff_plus"] = (
-            100 + 10 * ((raw_pred_all - mean) / std)
-        )
-
-        family_models[fam] = model
+    print("Rows after filtering:", len(df))
 
     #############################################
-    # 8. AGGREGATE TO PITCHER-SEASON-PITCH TYPE
+    # 3. FEATURE ENGINEERING
     #############################################
 
-    pitcher_stuff = (
-        full_data.groupby(["pitcher","game_year","pitch_type"])
+    df["velo"] = df["release_speed"]
+    df["spin"] = df["release_spin_rate"]
+    df["velo_sq"] = df["velo"] ** 2
+    df["spin_sq"] = df["spin"] ** 2
+
+    # movement in inches
+    df["ivb"] = df["pfx_z"] * 12
+    df["hb"] = df["pfx_x"] * 12
+    df["movement_total"] = np.sqrt(df["ivb"]**2 + df["hb"]**2)
+    df["movement_sq"] = df["movement_total"]**2
+    df["spin_eff_proxy"] = df["movement_total"] / df["spin"]
+
+    # release metrics
+    df["release_height"] = df["release_pos_z"]
+    df["release_side"] = df["release_pos_x"]
+
+    # drop missing
+    df = df.dropna(subset=[
+        "velo",
+        "spin",
+        "ivb",
+        "hb",
+        "release_extension"
+    ])
+
+    # relative spin
+    df["spin_diff"] = df["spin"] - df.groupby("pitcher")["spin"].transform("mean")
+
+    # pitch mirroring
+    df["release_diff"] = np.sqrt(
+    (df["release_height"] - df.groupby("pitcher")["release_height"].transform("mean"))**2 +
+    (df["release_side"] - df.groupby("pitcher")["release_side"].transform("mean"))**2
+    )
+
+    # Seam shifted wake prox
+    df["expected_movement"] = df["spin"] * 0.0005
+    df["ssw_proxy"] = df["movement_total"] - df["expected_movement"]
+
+    # Movement Shape
+    df["movement_ratio"] = df["hb"] / (abs(df["ivb"]) + 1)
+
+    df["break_angle"] = np.degrees(
+        np.arctan2(df["ivb"], df["hb"])
+    )
+
+    # Add whiff indicator
+    df["is_whiff"] = df["description"].isin([
+    "swinging_strike",
+    "swinging_strike_blocked"
+    ]).astype(int)
+
+    # Weak contact indicator
+    df["weak_contact"] = (
+    (df["estimated_woba_using_speedangle"] < 0.2)
+    ).astype(int)
+
+    # Foul ball indicator
+    df["is_foul"] = (df["description"] == "foul").astype(int)
+
+    #############################################
+    # 4. IDENTIFY PRIMARY FASTBALL AND SPEED DIFFERENTIALS
+    #############################################
+
+    FASTBALL_TYPES = ["FF","SI","FC"]
+
+    fastball_df = df[df["pitch_type"].isin(FASTBALL_TYPES)]
+
+    fb_stats = (
+        fastball_df
+        .groupby("pitcher")
         .agg(
-            usage=("pitch_type","count"),
-            avg_stuff=("Stuff_plus","mean")
+            fb_velo=("velo","mean"),
+            fb_ivb=("ivb","mean"),
+            fb_hb=("hb","mean")
         )
         .reset_index()
     )
 
-    # Optional: minimum total pitch threshold
-    pitcher_stuff = pitcher_stuff[pitcher_stuff["usage"] >= 25]
+    df = df.merge(fb_stats, on="pitcher", how="left")
+
+    df["velo_diff"] = df["velo"] - df["fb_velo"]
+    df["ivb_diff"] = df["ivb"] - df["fb_ivb"]
+    df["hb_diff"] = df["hb"] - df["fb_hb"]
+
+    # magnitude of movement difference
+    df["movement_diff"] = np.sqrt(df["ivb_diff"]**2 + df["hb_diff"]**2)
 
     #############################################
-    # 9. SAVE OUTPUT
+    # 5. BUILD TARGET
+    #############################################
+    # Miss difficulty
+    df["is_whiff"] = df["description"].isin([
+        "swinging_strike",
+        "swinging_strike_blocked"
+    ]).astype(int)
+
+    # Weak contact
+    df["weak_contact"] = (
+        df["estimated_woba_using_speedangle"] < 0.2
+    ).astype(int)
+
+    # Contact suppression
+    df["contact_value"] = 1 - df["estimated_woba_using_speedangle"]
+
+    # Fill missing xwoba
+    event_weights = (
+        1 - df.groupby("description")["estimated_woba_using_speedangle"].mean()
+    )
+
+    df["contact_value"] = df["contact_value"].fillna(
+        df["description"].map(event_weights)
+    )
+
+    #############################################
+    # 6. BUILD TARGET
     #############################################
 
-    con.register("pitcher_stuff_df", pitcher_stuff)
+    # Final target
+    df["target"] = (
+        0.65 * df["is_whiff"]       
+        + 0.30 * df["weak_contact"]   
+        + 0.15 * df["contact_value"] 
+    )
+
+    #############################################
+    # 6. PREPARE MODEL DATA
+    #############################################
+    stuff_features = [
+
+        # core physics
+        "velo",
+        "spin",
+        "ivb",
+        "hb",
+        "movement_total",
+
+        # efficiency / wake
+        "spin_eff_proxy",
+        "ssw_proxy",
+
+        # release traits
+        "release_extension",
+        "release_height",
+        "release_side",
+        "release_diff",
+
+        # fastball relative
+        "velo_diff",
+        "ivb_diff",
+        "hb_diff",
+        "movement_diff",
+        "spin_diff",
+
+        # movement shape
+        "movement_ratio",
+        "break_angle",
+
+        # nonlinear
+        "velo_sq",
+        "spin_sq",
+        "movement_sq"
+    ]
+
+    velo_features = [
+        "velo",
+        "velo_sq",
+        "velo_diff"
+    ]
+
+    shape_features = [
+
+        "spin",
+        "spin_sq",
+        "spin_eff_proxy",
+        "ssw_proxy",
+
+        "ivb",
+        "hb",
+        "movement_total",
+        "movement_sq",
+
+        "release_extension",
+        "release_height",
+        "release_side",
+        "release_diff",
+
+        "ivb_diff",
+        "hb_diff",
+        "movement_diff",
+
+        "movement_ratio",
+        "break_angle",
+
+        "spin_diff"
+    ]
+
+    # automatically detect pitch dummy columns
+    pitch_cols = [c for c in df.columns if c.startswith("pitch_") and c != "pitch_type"]
+
+    stuff_features = stuff_features + pitch_cols
+
+    # remove rows with missing values
+    df = df.dropna(subset=stuff_features + ["target"])
+    y = df["target"]
+
+    #############################################
+    # 7. TRAIN STUFF MODEL
+    #############################################
+    feature_means = df[stuff_features].mean()
+
+    models = {}
+
+    for pitch in df["pitch_type"].unique():
+
+        pitch_df = df[df["pitch_type"] == pitch]
+
+        X = pitch_df[stuff_features]
+        y = pitch_df["target"]
+
+        model = RandomForestRegressor(
+            n_estimators=120,
+            max_depth=8,
+            min_samples_leaf=75,
+            n_jobs=-1,
+            random_state=42
+        )
+
+        model.fit(X, y)
+
+        models[pitch] = model
+
+        ################################
+        # FULL STUFF PREDICTION
+        ################################
+
+        df.loc[pitch_df.index, "stuff_pred"] = model.predict(X)
+
+        ################################
+        # VELO CONTRIBUTION
+        ################################
+
+        X_velo = X.copy()
+
+        # Neutralize shape features
+        for col in stuff_features:
+            if col not in velo_features:
+                X_velo[col] = feature_means[col]
+
+        df.loc[pitch_df.index, "velo_pred"] = model.predict(X_velo)
+
+        ################################
+        # SHAPE CONTRIBUTION
+        ################################
+
+        X_shape = X.copy()
+
+        # Neutralize velocity features
+        for col in stuff_features:
+            if col not in shape_features:
+                X_shape[col] = feature_means[col]
+
+        df.loc[pitch_df.index, "shape_pred"] = model.predict(X_shape)
+
+    #############################################
+    # 8. AGGREGATE TO PITCH LEVEL
+    #############################################
+
+    stuff_pitch = (
+        df.groupby(["pitcher","game_year","pitch_type"])
+        .agg(
+            stuff_value=("stuff_pred","mean"),
+            shape_value=("shape_pred","mean"),
+            velo_value=("velo_pred","mean"),
+            pitches=("stuff_pred","count")
+        )
+        .reset_index()
+    )
+
+    #############################################
+    # 9. REMOVE SMALL SAMPLES
+    #############################################
+
+    stuff_pitch = stuff_pitch[stuff_pitch["pitches"] >= 10]
+
+
+    #############################################
+    # 10. NORMALIZE INTO STUFF+
+    #############################################
+
+    stuff_pitch["Stuff_plus"] = (
+        stuff_pitch
+        .groupby("pitch_type")["stuff_value"]
+        .transform(lambda x: 100 + 10*((x-x.mean())/x.std()))
+    )
+
+    stuff_pitch["Shape_plus"] = (
+        stuff_pitch
+        .groupby("pitch_type")["shape_value"]
+        .transform(lambda x: 100 + 10*((x-x.mean())/x.std()))
+    )
+
+    stuff_pitch["Velo_plus"] = (
+        stuff_pitch
+        .groupby("pitch_type")["velo_value"]
+        .transform(lambda x: 100 + 10*((x-x.mean())/x.std()))
+    )
+
+    #############################################
+    # 11. SAVE RESULTS TO DUCKDB
+    #############################################
+
+    con.register("stuff_plus_df", stuff_pitch)
 
     con.execute("""
-    CREATE OR REPLACE TABLE pitcher_stuff AS
-    SELECT *
-    FROM pitcher_stuff_df
+        CREATE OR REPLACE TABLE pitcher_stuff AS
+        SELECT * FROM stuff_plus_df
     """)
 
-    print("Physics-Based Stuff+ (Full Arsenal) Complete")
+    print("Stuff+ model complete.")
+
     con.close()
 
 #############################################
-# 8. BUILD FULL PITCHING MODEL
+# 9. CALCULATE GAP BETWEEN PITCHGRADE AND STUFF
+#############################################
+def calculate_pitch_gap():
+    #############################################
+    # 1 CONNECT TO DATABASE
+    #############################################
+
+    con = duckdb.connect("pitch_design.db")
+
+    #############################################
+    # 2 LOAD TABLES
+    #############################################
+
+    stuff = con.execute("""
+        SELECT
+            pitcher,
+            game_year,
+            pitch_type,
+            Stuff_plus
+        FROM pitcher_stuff
+    """).df()
+
+    grade = con.execute("""
+        SELECT
+            pitcher,
+            game_year,
+            pitch_type,
+            PitchGrade_plus
+        FROM pitch_grade
+    """).df()
+
+    #############################################
+    # 3 MERGE DATA
+    #############################################
+
+    df = stuff.merge(
+        grade,
+        on=["pitcher","game_year","pitch_type"],
+        how="inner"
+    )
+
+    #############################################
+    # 4 CALCULATE GAP
+    #############################################
+
+    df["PitchGap"] = df["Stuff_plus"] - df["PitchGrade_plus"]
+
+    #############################################
+    # 5 SAVE RESULTS
+    #############################################
+
+    con.register("pitch_gap_df", df)
+
+    con.execute("""
+        CREATE OR REPLACE TABLE pitcher_pitch_gap AS
+        SELECT * FROM pitch_gap_df
+    """)
+
+    print("PitchGap model complete.")
+
+    con.close()
+
+#############################################
+# 9. BUILD FULL PITCHING MODEL
 #############################################
 def compile_full_pitch_model():
     con = duckdb.connect("pitch_design.db")
@@ -1213,26 +980,16 @@ def compile_full_pitch_model():
         rs.season,
         rs.pitch_type,
         rs.pitches_thrown,
-        rs.usage_rate,        
+        rs.usage_rate,    
+        rs.release_speed,     
         rs.release_pos_x,   
         rs.release_pos_y, 
-        rs.arm_angle,
-        rs.effective_speed,  
-        rs.halfway_velo_x,  
-        rs.halfway_velo_y,  
-        rs.halfway_velo_z,  
-        rs.halfway_accel_x,  
-        rs.halfway_accel_y,  
-        rs.halfway_accel_z,  
         rs.release_extension,
-        rs.release_pos_y,
+        rs.arm_angle, 
         rs.release_spin_rate,
         rs.horizontal_break,
         rs.vertical_break,  
         rs.spin_axis,
-        rs.gravity_break,
-        rs.arm_side_break,
-        rs.inside_batter_break,
         rs.whiffs,
         rs.swings,   
         rs.csw_rate,    
@@ -1241,12 +998,15 @@ def compile_full_pitch_model():
         rs.barrels,
         pg.whiff_plus,
         pg.Contact_plus,
-        pg.Swing_plus,
+        pg.Chase_plus,
         pg.Strike_plus,
         pg.Ball_plus,
-        pg.Pitch_Grade_raw,
-        pg.Pitch_Grade,
-        ps.avg_stuff
+        pg.Pitch_score,
+        pg.PitchGrade_plus,
+        ps.velo_plus,
+        ps.shape_plus,
+        ps.stuff_plus,
+        ppg.PitchGap
     FROM(
         SELECT
             pitcher,
@@ -1257,7 +1017,7 @@ def compile_full_pitch_model():
             AVG(release_pos_x) AS release_pos_x,   
             AVG(release_pos_y) AS release_pos_y, 
             AVG(arm_angle) AS arm_angle,
-            AVG(effective_speed) AS effective_speed,  
+            AVG(release_speed) AS release_speed,  
             AVG(vx0) AS halfway_velo_x,  
             AVG(vy0) AS halfway_velo_y,  
             AVG(vz0) AS halfway_velo_z,  
@@ -1284,6 +1044,7 @@ def compile_full_pitch_model():
     INNER JOIN pitch_grade pg ON rs.pitcher = pg.pitcher AND rs.season = pg.game_year AND rs.pitch_type = pg.pitch_type
     INNER JOIN pitcher_stuff ps ON rs.pitcher = ps.pitcher AND rs.season = ps.game_year AND rs.pitch_type = ps.pitch_type 
     INNER JOIN player_id_map p ON rs.pitcher = p.key_mlbam
+    INNER JOIN pitcher_pitch_gap ppg ON rs.pitcher = ppg.pitcher AND rs.season = ppg.game_year AND rs.pitch_type = ppg.pitch_type  
     ORDER BY rs.pitcher, rs.season DESC, usage_rate DESC;""")
 
 
@@ -1301,7 +1062,8 @@ if __name__ == '__main__':
     calculate_contact_plus()
     calculate_strike_plus()
     calculate_ball_plus()
-    calculate_swing_plus()
+    calculate_chase_plus()
     calculate_pitch_composite_score()
     calculate_stuff_plus()
+    calculate_pitch_gap()
     compile_full_pitch_model()
